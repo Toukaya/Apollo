@@ -1090,6 +1090,22 @@ namespace config {
     return opts;
   }
 
+  void log_config_settings(const std::unordered_map<std::string, std::string> &vars, bool save) {
+    for (auto &[name, val] : vars) {
+      bool is_redacted = std::ranges::find(config::redacted_config, name) != config::redacted_config.end();
+
+    #ifdef _WIN32
+      BOOST_LOG(info) << "config: ["sv << name << "] -- ["sv << (is_redacted ? "[redacted]" : utf8ToAcp(val)) << ']';
+    #else
+      BOOST_LOG(info) << "config: ["sv << name << "] -- ["sv << (is_redacted ? "[redacted]" : val) << ']';
+    #endif
+
+      if (save) {
+        modified_config_settings[name] = val;
+      }
+    }
+  }
+
   void apply_config(std::unordered_map<std::string, std::string> &&vars) {
 #ifndef __ANDROID__
     // TODO: Android can possibly support this
@@ -1098,14 +1114,7 @@ namespace config {
     }
 #endif
 
-    for (auto &[name, val] : vars) {
-    #ifdef _WIN32
-      BOOST_LOG(info) << "config: ["sv << name << "] -- ["sv << utf8ToAcp(val) << ']';
-    #else
-      BOOST_LOG(info) << "config: ["sv << name << "] -- ["sv << val << ']';
-    #endif
-      modified_config_settings[name] = val;
-    }
+    log_config_settings(vars, true);
 
     bool_f(vars, "headless_mode", video.headless_mode);
     bool_f(vars, "limit_framerate", video.limit_framerate);
