@@ -990,6 +990,10 @@ namespace nvhttp {
     }
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 
+    if (!config::nvhttp.external_ip.empty()) {
+      tree.put("root.ExternalIP", config::nvhttp.external_ip);
+    }
+
     tree.put("root.PairStatus", pair_status);
 
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
