@@ -40,7 +40,7 @@ The virtual display works just like any physically attached monitors with SudoVD
 
 This fork adds a working Windows remote microphone path for compatible Moonlight/Artemis clients.
 
-Apollo accepts the client's Opus microphone packets, decodes them on the host, and renders the audio into the Steam playback endpoint `Speakers (Steam Streaming Microphone)`. Host applications should then select `Microphone (Steam Streaming Microphone)` as their microphone source.
+Apollo accepts raw 16-bit little-endian PCM microphone packets from the client (default 48 kHz mono, 10 ms wire frames), converts them to float32 inline in `mic_write_wasapi_t::write_data`, and renders directly into the Steam playback endpoint `Speakers (Steam Streaming Microphone)`. Host applications should then select `Microphone (Steam Streaming Microphone)` as their microphone source. The mic format (sample rate, channel count, bit depth, sample format, frame duration) is advertised by the host via a custom `a=fmtp:97 x-ml-mic.*` extension on the RTSP SDP mic block; the client refuses to enable mic if the attributes are absent.
 
 Setup and implementation notes are documented in [docs/remote_microphone.md](docs/remote_microphone.md).
 

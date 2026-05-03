@@ -7,9 +7,9 @@ This fork adds a working host-side remote microphone path for Apollo, focused on
 The microphone path is:
 
 1. A compatible Moonlight/Artemis client captures local microphone audio.
-2. The client sends encrypted or unencrypted microphone packets to Apollo on the dedicated microphone stream.
-3. Apollo receives the packets, decrypts them when needed, and decodes the Opus frames on the host.
-4. Apollo renders the decoded PCM into the Steam playback endpoint `Speakers (Steam Streaming Microphone)`.
+2. The client sends raw little-endian PCM microphone packets to Apollo on the dedicated microphone stream (encrypted via AES-CBC when negotiated). The wire format (sample rate, channel count, bit depth, sample format, frame duration) is advertised by the host through a custom `a=fmtp:97 x-ml-mic.*` extension on the RTSP SDP, so client and host stay in lockstep without any hardcoded format.
+3. Apollo receives the packets, decrypts them when needed, and converts the raw PCM payload (S16LE / S24LE / S32LE / F32LE) to float32 in-place on the host. There is no Opus codec involved on the mic path.
+4. Apollo renders the converted PCM into the Steam playback endpoint `Speakers (Steam Streaming Microphone)`. Mono client input is duplicated to stereo at WASAPI copy time.
 5. Host applications consume that audio from the paired capture endpoint `Microphone (Steam Streaming Microphone)`.
 
 This keeps the host-side application flow simple: Apollo writes into Steam Streaming Microphone, and games, chat apps, or capture tools use `Microphone (Steam Streaming Microphone)` as the microphone.
@@ -20,7 +20,7 @@ The working implementation in this fork includes:
 
 - Dedicated microphone session handling in the stream path, including packet receive, optional decryption, and per-session lifecycle management.
 - Windows microphone backend initialization and teardown that stays alive for the full remote microphone session.
-- A Steam-backed Windows microphone path that auto-detects the Steam microphone render/capture pair, normalizes only that pair to `2ch, 32-bit, 48000 Hz` when microphone streaming starts, decodes Opus microphone frames as mono float `48 kHz`, and writes them into the Steam microphone render buffer using a `float32` shared-mode render client.
+- A Steam-backed Windows microphone path that auto-detects the Steam microphone render/capture pair, normalizes only that pair to `2ch, 32-bit, 48000 Hz` when microphone streaming starts, converts the negotiated raw PCM mic frames (S16LE / S24LE / S32LE / F32LE) to float32 in-place, and writes them into the Steam microphone render buffer using a `float32` shared-mode render client. Mono client input is duplicated to stereo at copy time.
 - Host-side recovery for recoverable WASAPI failures such as device invalidation or audio service restarts.
 - A Remote Microphone Debug panel in the web UI that shows packet arrival, decode status, render status, signal detection, counters, and recent mic events.
 
@@ -30,7 +30,7 @@ The working implementation in this fork includes:
 - `src/audio.cpp`: shared microphone debug state and persistent audio context ownership for the redirect device.
 - `src/platform/windows/audio.cpp`: Windows microphone backend selection and redirect device ownership.
 - `src/platform/windows/apollo_vmic.cpp`: Steam Streaming Microphone backend wrapper.
-- `src/platform/windows/mic_write.cpp`: device discovery, WASAPI initialization, Opus decode, and Steam Streaming Microphone rendering.
+- `src/platform/windows/mic_write.cpp`: device discovery, WASAPI initialization, raw-PCM conversion to float, and Steam Streaming Microphone rendering.
 - `src_assets/common/assets/web/configs/tabs/AudioVideo.vue`: Remote Microphone Debug UI.
 
 ## Windows Requirements
@@ -54,7 +54,7 @@ The working implementation in this fork includes:
 The Audio/Video page on Windows exposes a Remote Microphone Debug panel that shows:
 
 - whether the client is sending packets
-- whether Apollo is decoding microphone frames
+- whether Apollo is converting microphone frames to float
 - whether Apollo is rendering into Steam Streaming Microphone
 - whether non-silent input is being detected
 - which endpoint mix format Apollo discovered
@@ -64,4 +64,4 @@ The Audio/Video page on Windows exposes a Remote Microphone Debug panel that sho
 - how mono input is mapped to the host channels
 - the most recent mic errors and recent mic events
 
-This view is intended to quickly separate client capture problems from host decode/render problems.
+This view is intended to quickly separate client capture problems from host convert/render problems.
