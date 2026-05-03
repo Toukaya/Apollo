@@ -2,6 +2,29 @@
 
 Apollo is a self-hosted desktop stream host for [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android). Offering low latency, native client resolution, cloud gaming server capabilities with support for AMD, Intel, and Nvidia GPUs for hardware encoding. Software encoding is also available. A web UI is provided to allow configuration and client pairing from your favorite web browser. Pair from the local server or any mobile device.
 
+## About This Fork
+
+This is a fork of [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo), maintained on the [Toukaya](https://github.com/Toukaya) account. It pairs with the [Toukaya/moonlight-qt-mic](https://github.com/Toukaya/moonlight-qt-mic) client fork. Both projects share the same `moonlight-common-c` submodule at [Toukaya/moonlight-common-c](https://github.com/Toukaya/moonlight-common-c) on branch `feat/mic-pcm`, so client and host build against an identical SHA and stay in lock-step on the wire protocol.
+
+The fork adds the following on top of upstream Apollo:
+
+### Raw PCM microphone ingest (replaces Opus)
+
+`mic_write.cpp` no longer carries an Opus decoder, jitter buffer, FEC, or PLC paths. The host now accepts raw 16-bit little-endian PCM packets from the client (default 48 kHz mono, 10 ms wire frames), converts inline to float32, optionally duplicates mono → stereo, and renders directly into the WASAPI Steam Streaming Microphone playback endpoint. Net source change is roughly −89 lines on this file alone. See **About Remote Microphone Redirection** below for the runtime details.
+
+### SDP-negotiated mic format
+
+`rtsp.cpp::cmd_describe` advertises a custom `a=fmtp:97 x-ml-mic.*` extension in the RTSP SDP mic block, conveying sample rate / channel count / bit depth / sample format / frame duration. The host calls `audio::set_mic_input_format(...)` (a new virtual on `audio_control_t`, overridden in the Windows backend) to propagate the negotiated format down to the WASAPI write path before mic init. Clients that do not see this extension refuse to enable mic rather than silently falling back to Opus, so the protocol version is gated at the SDP layer.
+
+### Fork-identifying build markers
+
+- `CMakeLists.txt` `project(Apollo VERSION ...)` set to **0.4.7** (claiming the version that upstream skipped between v0.4.7-alpha.1 and v0.4.8); annotated git tag `v0.4.7` exists.
+- `src/main.cpp` emits an extra startup banner line: `[Toukaya PCM-mic fork] mic ingest = raw PCM via SDP a=fmtp:97 x-ml-mic.* (Opus mic path removed)` so a running binary is unambiguously identifiable.
+
+### enet pinned to 115a10b
+
+The bundled `moonlight-common-c/enet` sub-submodule is held at `115a10b`. The newer enet `c7353c0` (which contains commit `78cc9b4`, "Only pass the peer's local address if the host was wildcard bound") empirically produces severe mic distortion on Apollo's IPv6 dual-stack Windows control socket — likely because of how local-address propagation feeds into the cipher-state derivation that the mic path's encryption layer depends on. Until the underlying issue is reported and fixed upstream, the downgrade is the host-side fix.
+
 Major features:
 
 - [x] Built-in Virtual Display with HDR support that matches the resolution/framerate config of your client automatically
