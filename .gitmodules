@@ -65,4 +65,4 @@
 [submodule "third-party/moonlight-common-c"]
 	path = third-party/moonlight-common-c
 	url = https://github.com/Toukaya/moonlight-common-c
-	branch = feat/apollo-mic-pcm
+	branch = feat/mic-pcm
