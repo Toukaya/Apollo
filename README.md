@@ -21,9 +21,9 @@ The fork adds the following on top of upstream Apollo:
 - `CMakeLists.txt` `project(Apollo VERSION ...)` set to **0.4.7** (claiming the version that upstream skipped between v0.4.7-alpha.1 and v0.4.8); annotated git tag `v0.4.7` exists.
 - `src/main.cpp` emits an extra startup banner line: `[Toukaya PCM-mic fork] mic ingest = raw PCM via SDP a=fmtp:97 x-ml-mic.* (Opus mic path removed)` so a running binary is unambiguously identifiable.
 
-### enet pinned to 115a10b
+### enet pinned to 115a10b (empirical known-good)
 
-The bundled `moonlight-common-c/enet` sub-submodule is held at `115a10b`. The newer enet `c7353c0` (which contains commit `78cc9b4`, "Only pass the peer's local address if the host was wildcard bound") empirically produces severe mic distortion on Apollo's IPv6 dual-stack Windows control socket — likely because of how local-address propagation feeds into the cipher-state derivation that the mic path's encryption layer depends on. Until the underlying issue is reported and fixed upstream, the downgrade is the host-side fix.
+The bundled `moonlight-common-c/enet` sub-submodule is held at `115a10b` rather than the newer `c7353c0`. This is an empirical "known-good" pin, not a fix for a known upstream bug. The three commits in the upgrade range — `c7353c0` (lowercase Windows include casing), `78cc9b4` (gates `localAddress` source-hint on wildcard bind), `dea6fb5` (FreeBSD-only) — are all functional no-ops on Apollo's wildcard-bound (`0.0.0.0` / `::`) Windows enet host. Earlier debugging in this fork tentatively associated the upgrade with mic distortion, but that finding was later shown to be confounded with stale ninja link-time artifacts; once a forced full clean rebuild is performed, the buzz disappears regardless of which enet pointer is in use. The pin is kept until a future clean-rebuild test on `c7353c0` confirms parity, at which point it can be lifted.
 
 Major features:
 
