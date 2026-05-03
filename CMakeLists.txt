@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.20)
 # `cmake_path(CONVERT ... TO_NATIVE_PATH_LIST ...)` requires 3.20
 # todo - set this conditionally
 
-project(Apollo VERSION 0.0.1
+project(Apollo VERSION 0.4.7
         DESCRIPTION "Self-hosted game stream host for Artemis (Toukaya PCM-mic fork)"
         HOMEPAGE_URL "https://github.com/Toukaya/Apollo")
 
