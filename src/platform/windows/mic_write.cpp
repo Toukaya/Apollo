@@ -15,7 +15,6 @@
 #include <Audioclient.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
-#include <opus/opus.h>
 #include <synchapi.h>
 
 #include "PolicyConfig.h"
@@ -23,6 +22,10 @@
 #include "src/audio.h"
 #include "src/config.h"
 #include "src/logging.h"
+
+extern "C" {
+#include <moonlight-common-c/src/Limelight.h>
+}
 
 namespace platf::audio {
   namespace {
@@ -39,14 +42,12 @@ namespace platf::audio {
       2
     };
 
+    // The WASAPI render endpoint for Steam Streaming Microphone always uses
+    // 2-channel, 32-bit float, 48 kHz. This is the contract with the Steam
+    // audio driver and must not be changed.
     constexpr std::uint32_t decoded_sample_rate = 48000;
     constexpr REFERENCE_TIME buffer_duration_100ns = 1000000;
-    constexpr std::uint32_t default_packet_duration_samples = 960;
-    constexpr std::uint32_t max_packet_duration_samples = 5760;
     constexpr std::size_t max_queued_frames = decoded_sample_rate;
-    constexpr std::size_t max_queued_packets = 64;
-    constexpr std::size_t target_prebuffer_packets = 4;
-    constexpr std::size_t target_prebuffer_frames = default_packet_duration_samples * target_prebuffer_packets;
 
     template<typename T>
     void co_task_free(T *ptr) {
@@ -168,10 +169,6 @@ namespace platf::audio {
 
     std::uint16_t sequence_distance(std::uint16_t newer, std::uint16_t older) {
       return static_cast<std::uint16_t>(newer - older);
-    }
-
-    std::uint32_t timestamp_distance(std::uint32_t newer, std::uint32_t older) {
-      return static_cast<std::uint32_t>(newer - older);
     }
 
     bool recover_device(mic_write_wasapi_t &writer, HRESULT status, const char *operation) {
@@ -326,6 +323,59 @@ namespace platf::audio {
       );
     }
 
+    // Convert a raw PCM byte buffer to floats, appending to out_floats.
+    // Returns the number of per-channel sample frames appended.
+    int pcm_to_float(const char *data, std::size_t len, int sampleFormatId,
+                     std::deque<float> &out_floats) {
+      switch (sampleFormatId) {
+        case LI_MIC_FMT_S16LE: {
+          const int count = static_cast<int>(len / sizeof(int16_t));
+          const int16_t *src = reinterpret_cast<const int16_t *>(data);
+          for (int i = 0; i < count; ++i) {
+            int16_t raw;
+            std::memcpy(&raw, src + i, sizeof(raw));
+            out_floats.push_back(std::clamp(static_cast<float>(raw) / 32768.0f, -1.0f, 1.0f));
+          }
+          return count;
+        }
+        case LI_MIC_FMT_S24LE: {
+          // 3-byte little-endian signed samples
+          const int count = static_cast<int>(len / 3);
+          const uint8_t *src = reinterpret_cast<const uint8_t *>(data);
+          for (int i = 0; i < count; ++i) {
+            int32_t raw = static_cast<int32_t>(src[i * 3]) |
+                          (static_cast<int32_t>(src[i * 3 + 1]) << 8) |
+                          (static_cast<int32_t>(src[i * 3 + 2]) << 16);
+            // Sign-extend from 24 bits
+            if (raw & 0x800000) { raw |= static_cast<int32_t>(0xFF000000); }
+            out_floats.push_back(std::clamp(static_cast<float>(raw) / 8388608.0f, -1.0f, 1.0f));
+          }
+          return count;
+        }
+        case LI_MIC_FMT_S32LE: {
+          const int count = static_cast<int>(len / sizeof(int32_t));
+          const int32_t *src = reinterpret_cast<const int32_t *>(data);
+          for (int i = 0; i < count; ++i) {
+            int32_t raw;
+            std::memcpy(&raw, src + i, sizeof(raw));
+            out_floats.push_back(std::clamp(static_cast<float>(raw) / 2147483648.0f, -1.0f, 1.0f));
+          }
+          return count;
+        }
+        case LI_MIC_FMT_F32LE:
+        default: {
+          const int count = static_cast<int>(len / sizeof(float));
+          const float *src = reinterpret_cast<const float *>(data);
+          for (int i = 0; i < count; ++i) {
+            float raw;
+            std::memcpy(&raw, src + i, sizeof(raw));
+            out_floats.push_back(std::clamp(raw, -1.0f, 1.0f));
+          }
+          return count;
+        }
+      }
+    }
+
   }  // namespace
 
   mic_write_wasapi_t::mic_write_wasapi_t(std::string backend_name,
@@ -342,6 +392,10 @@ namespace platf::audio {
 
   std::string_view mic_write_wasapi_t::backend_id() const {
     return backend_name;
+  }
+
+  void mic_write_wasapi_t::set_input_format(const mic_input_format_t &fmt) {
+    input_format = fmt;
   }
 
   bool mic_write_wasapi_t::find_target_device(EDataFlow flow, std::wstring &device_id, std::string &device_name) {
@@ -512,16 +566,23 @@ namespace platf::audio {
       return false;
     }
 
+    // Determine mono→stereo duplication based on negotiated client channel count.
+    duplicate_to_stereo = (input_format.channels == 1);
+
     const auto render_format_string = waveformat_to_pretty_string(required_render_format);
-    const std::string channel_mapping = "Duplicate mono microphone input to stereo render channels";
+    const std::string channel_mapping = duplicate_to_stereo
+      ? "Duplicate mono client PCM input to stereo render channels"
+      : "Pass stereo client PCM input to stereo render channels";
 
     BOOST_LOG(info) << "Client microphone redirection target: " << target_device_name
                     << " [mix=" << endpoint_mix_string
                     << ", render-device=" << render_endpoint_info.device_format
                     << ", capture-device=" << capture_endpoint_info.device_format
                     << ", render=" << render_format_string
-                    << ", init=required float32 shared-mode render format"
-                    << ", resampling=off"
+                    << ", client-fmt=" << input_format.sampleRate << "Hz/"
+                    << input_format.channels << "ch/" << (input_format.bytesPerSample * 8) << "bit"
+                    << ", frame=" << input_format.frameDurationMs << "ms"
+                    << ", mono-to-stereo=" << (duplicate_to_stereo ? "yes" : "no")
                     << ']';
 
     BOOST_LOG(info) << "Paired Steam microphone capture endpoint: " << capture_device_name
@@ -556,12 +617,13 @@ namespace platf::audio {
   }
 
   int mic_write_wasapi_t::init() {
-    int opus_error = OPUS_OK;
-    opus_decoder = opus_decoder_create(decoded_sample_rate, 1, &opus_error);
-    if (opus_error != OPUS_OK || opus_decoder == nullptr) {
-      BOOST_LOG(error) << "Couldn't create Opus decoder for microphone redirection: " << opus_strerror(opus_error);
-      ::audio::mic_debug_on_backend_error("Could not create the Opus decoder for microphone redirection");
-      return -1;
+    // If no explicit input_format was provided, default to 48kHz mono s16le 10ms.
+    if (input_format.sampleRate == 0) {
+      input_format.sampleRate    = 48000;
+      input_format.channels      = 1;
+      input_format.sampleFormatId = LI_MIC_FMT_S16LE;
+      input_format.bytesPerSample = 2;
+      input_format.frameDurationMs = 10;
     }
 
     HRESULT status = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void **) &device_enum);
@@ -581,14 +643,13 @@ namespace platf::audio {
   }
 
   int mic_write_wasapi_t::write_data(const char *data, std::size_t len, std::uint16_t sequence_number, std::uint32_t timestamp) {
-    if (!audio_client || audio_render == nullptr || opus_decoder == nullptr || data == nullptr || len == 0 || !render_event) {
-      BOOST_LOG(warning) << "Client microphone packet rejected before decode because the WASAPI write path is not ready"
+    if (!audio_client || audio_render == nullptr || data == nullptr || len == 0 || !render_event) {
+      BOOST_LOG(warning) << "Client microphone packet rejected because the WASAPI write path is not ready"
                          << " [seq=" << sequence_number
                          << ", ts=" << timestamp
                          << ", len=" << len
                          << ", audio_client=" << static_cast<bool>(audio_client)
                          << ", audio_render=" << static_cast<bool>(audio_render != nullptr)
-                         << ", opus_decoder=" << static_cast<bool>(opus_decoder != nullptr)
                          << ", render_event=" << static_cast<bool>(render_event)
                          << ", data=" << static_cast<bool>(data != nullptr) << ']';
       return -1;
@@ -600,10 +661,8 @@ namespace platf::audio {
     }
 
     bool stale_packet = false;
-    bool duplicate_packet = false;
-    bool trimmed_packet_queue = false;
     {
-      std::lock_guard lock(queue_mutex);
+      std::lock_guard<std::mutex> lock(queue_mutex);
 
       if (has_playout_cursor) {
         const auto behind = sequence_distance(expected_sequence_number, sequence_number);
@@ -613,17 +672,37 @@ namespace platf::audio {
       }
 
       if (!stale_packet) {
-        auto [_, inserted] = pending_packets.emplace(sequence_number, queued_mic_packet_t {
-          std::vector<std::uint8_t> {reinterpret_cast<const std::uint8_t *>(data), reinterpret_cast<const std::uint8_t *>(data) + len},
-          sequence_number,
-          timestamp,
-          std::chrono::steady_clock::now()
-        });
+        // Convert raw PCM bytes directly to float and push into pending_frames.
+        const int samples_appended = pcm_to_float(data, len, input_format.sampleFormatId, pending_frames);
 
-        duplicate_packet = !inserted;
-        if (inserted && pending_packets.size() > max_queued_packets) {
-          pending_packets.erase(pending_packets.begin());
-          trimmed_packet_queue = true;
+        if (!has_playout_cursor) {
+          expected_sequence_number = sequence_number;
+          has_playout_cursor = true;
+        }
+        ++expected_sequence_number;
+
+        if (pending_frames.size() > max_queued_frames) {
+          const auto frames_to_trim = pending_frames.size() - max_queued_frames;
+          pending_frames.erase(pending_frames.begin(), pending_frames.begin() + static_cast<std::ptrdiff_t>(frames_to_trim));
+        }
+
+        float peak = 0.0f;
+        // Compute peak over the just-appended samples
+        const std::size_t start = pending_frames.size() > static_cast<std::size_t>(samples_appended)
+          ? pending_frames.size() - static_cast<std::size_t>(samples_appended) : 0;
+        for (std::size_t i = start; i < pending_frames.size(); ++i) {
+          float a = std::fabs(pending_frames[i]);
+          if (a > peak) { peak = a; }
+        }
+
+        const double normalized_level = static_cast<double>(peak);
+        const bool silent = peak < 0.015625f;
+        ::audio::mic_debug_on_packet_decoded(sequence_number, normalized_level, silent);
+        ::audio::mic_debug_on_packet_rendered(sequence_number, normalized_level, silent);
+
+        if (!first_packet_written_logged) {
+          first_packet_written_logged = true;
+          BOOST_LOG(info) << "Client PCM microphone audio is being rendered into [" << target_device_name << ']';
         }
       }
     }
@@ -633,159 +712,19 @@ namespace platf::audio {
       return 0;
     }
 
-    if (duplicate_packet) {
-      ::audio::mic_debug_on_packet_dropped(sequence_number, "Dropped a duplicate microphone packet");
-      return 0;
-    }
-
-    if (trimmed_packet_queue) {
-      BOOST_LOG(debug) << "Trimmed queued microphone packets for [" << target_device_name << "] to keep jitter-buffer latency bounded";
-      ::audio::mic_debug_on_render_error(sequence_number, "Queued microphone packets grew too large, so older packets were dropped to keep latency bounded");
-    }
-
     SetEvent(render_event.get());
     return static_cast<int>(len);
-  }
-
-  std::uint32_t mic_write_wasapi_t::infer_packet_duration_samples(std::uint32_t current_timestamp, std::uint32_t next_timestamp) const {
-    const auto delta = timestamp_distance(next_timestamp, current_timestamp);
-    if (delta >= 120 && delta <= max_packet_duration_samples) {
-      return delta;
-    }
-    return default_packet_duration_samples;
-  }
-
-  bool mic_write_wasapi_t::should_conceal_missing_packet_locked() const {
-    if (pending_packets.empty()) {
-      return false;
-    }
-
-    if (pending_packets.find(static_cast<std::uint16_t>(expected_sequence_number + 1)) != pending_packets.end()) {
-      return true;
-    }
-
-    const auto delta = sequence_distance(pending_packets.begin()->first, expected_sequence_number);
-    return delta != 0 && delta < 0x8000;
-  }
-
-  void mic_write_wasapi_t::append_decoded_frames(const float *samples, int decoded_frames, std::uint16_t sequence_number) {
-    if (samples == nullptr || decoded_frames <= 0) {
-      return;
-    }
-
-    float peak = 0.0f;
-    {
-      std::lock_guard lock(queue_mutex);
-      for (int frame = 0; frame < decoded_frames; ++frame) {
-        const float sample = std::clamp(samples[frame], -1.0f, 1.0f);
-        peak = std::max(peak, std::fabs(sample));
-        pending_frames.push_back(sample);
-      }
-
-      if (pending_frames.size() > max_queued_frames) {
-        const auto frames_to_trim = pending_frames.size() - max_queued_frames;
-        pending_frames.erase(pending_frames.begin(), pending_frames.begin() + static_cast<std::ptrdiff_t>(frames_to_trim));
-      }
-    }
-
-    const double normalized_level = std::clamp(static_cast<double>(peak), 0.0, 1.0);
-    const bool silent = peak < 0.015625f;
-    ::audio::mic_debug_on_packet_decoded(sequence_number, normalized_level, silent);
-    ::audio::mic_debug_on_packet_rendered(sequence_number, normalized_level, silent);
-  }
-
-  bool mic_write_wasapi_t::decode_next_packet() {
-    queued_mic_packet_t packet;
-    std::uint16_t packet_sequence = 0;
-    std::uint32_t frame_duration_samples = default_packet_duration_samples;
-    bool decode_fec = false;
-    bool decode_plc = false;
-
-    {
-      std::lock_guard lock(queue_mutex);
-
-      if (!has_playout_cursor) {
-        if (pending_packets.size() < target_prebuffer_packets) {
-          return false;
-        }
-
-        expected_sequence_number = pending_packets.begin()->first;
-        expected_timestamp = pending_packets.begin()->second.timestamp;
-        has_playout_cursor = true;
-      }
-
-      packet_sequence = expected_sequence_number;
-
-      if (auto current = pending_packets.find(expected_sequence_number); current != pending_packets.end()) {
-        if (auto next = std::next(current); next != pending_packets.end()) {
-          frame_duration_samples = infer_packet_duration_samples(current->second.timestamp, next->second.timestamp);
-        }
-
-        packet = std::move(current->second);
-        pending_packets.erase(current);
-      } else if (auto next = pending_packets.find(static_cast<std::uint16_t>(expected_sequence_number + 1)); next != pending_packets.end()) {
-        frame_duration_samples = infer_packet_duration_samples(expected_timestamp, next->second.timestamp);
-        packet = next->second;
-        decode_fec = true;
-      } else if (should_conceal_missing_packet_locked()) {
-        decode_plc = true;
-      } else {
-        return false;
-      }
-    }
-
-    std::vector<float> decoded_pcm(max_packet_duration_samples);
-    int decoded_frames = 0;
-    if (decode_plc) {
-      decoded_frames = opus_decode_float(opus_decoder, nullptr, 0, decoded_pcm.data(), static_cast<int>(frame_duration_samples), 0);
-      BOOST_LOG(debug) << "Applying Opus PLC for missing microphone packet on [" << target_device_name << "] sequence " << packet_sequence;
-    } else if (decode_fec) {
-      decoded_frames = opus_decode_float(
-        opus_decoder,
-        packet.payload.data(),
-        static_cast<opus_int32>(packet.payload.size()),
-        decoded_pcm.data(),
-        static_cast<int>(frame_duration_samples),
-        1
-      );
-      BOOST_LOG(debug) << "Applying Opus FEC for missing microphone packet on [" << target_device_name << "] sequence " << packet_sequence;
-    } else {
-      decoded_frames = opus_decode_float(
-        opus_decoder,
-        packet.payload.data(),
-        static_cast<opus_int32>(packet.payload.size()),
-        decoded_pcm.data(),
-        static_cast<int>(decoded_pcm.size()),
-        0
-      );
-    }
-
-    if (decoded_frames <= 0) {
-      ::audio::mic_debug_on_decode_error(packet_sequence, "The host could not decode a microphone frame from the jitter buffer");
-      std::vector<float> silent_pcm(frame_duration_samples, 0.0f);
-      append_decoded_frames(silent_pcm.data(), static_cast<int>(silent_pcm.size()), packet_sequence);
-      decoded_frames = static_cast<int>(silent_pcm.size());
-    } else {
-      append_decoded_frames(decoded_pcm.data(), decoded_frames, packet_sequence);
-
-      if (!first_packet_written_logged) {
-        first_packet_written_logged = true;
-        BOOST_LOG(info) << "Client microphone audio is being rendered into [" << target_device_name << ']';
-      }
-    }
-
-    {
-      std::lock_guard lock(queue_mutex);
-      expected_sequence_number = static_cast<std::uint16_t>(expected_sequence_number + 1);
-      expected_timestamp += static_cast<std::uint32_t>(decoded_frames);
-    }
-
-    return decoded_frames > 0;
   }
 
   void mic_write_wasapi_t::render_loop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_SPEED_OVER_MEMORY);
     platf::adjust_thread_priority(platf::thread_priority_e::high);
+
+    // Prebuffer: 4 frames worth of samples at the input format's rate.
+    const std::size_t frame_samples = static_cast<std::size_t>(input_format.sampleRate) *
+                                      static_cast<std::size_t>(input_format.frameDurationMs) / 1000 *
+                                      static_cast<std::size_t>(input_format.channels);
+    const std::size_t target_prebuffer_frames = frame_samples * 4;
 
     while (!stop_render_thread) {
       if (!audio_client || audio_render == nullptr || !render_event) {
@@ -823,40 +762,20 @@ namespace platf::audio {
         continue;
       }
 
-      while (true) {
-        std::size_t queued_frames = 0;
-        std::size_t queued_packets = 0;
-        {
-          std::lock_guard lock(queue_mutex);
-          queued_frames = pending_frames.size();
-          queued_packets = pending_packets.size();
-        }
-
-        if (queued_frames >= target_prebuffer_frames || queued_packets == 0) {
-          break;
-        }
-
-        if (!decode_next_packet()) {
-          break;
-        }
-      }
-
       UINT32 queued_frames = 0;
-      std::size_t queued_packets = 0;
       {
-        std::lock_guard lock(queue_mutex);
+        std::lock_guard<std::mutex> lock(queue_mutex);
         queued_frames = std::min<UINT32>(frames_available, static_cast<UINT32>(pending_frames.size()));
-        queued_packets = pending_packets.size();
       }
 
-      const auto buffered_frames_total = padding + queued_frames;
+      const auto buffered_frames_total = static_cast<std::size_t>(padding) + queued_frames;
 
       if (!playout_started) {
         if (buffered_frames_total < target_prebuffer_frames) {
           if (!playout_wait_logged) {
             playout_wait_logged = true;
             BOOST_LOG(debug) << "Waiting for microphone playout prebuffer on [" << target_device_name << "], queued "
-                             << queued_frames << " frames, " << queued_packets << " buffered packets, padding " << padding << ", total buffered "
+                             << queued_frames << " frames, padding " << padding << ", total buffered "
                              << buffered_frames_total << " of " << target_prebuffer_frames << " target frames";
           }
           continue;
@@ -865,18 +784,8 @@ namespace platf::audio {
         playout_started = true;
         playout_wait_logged = false;
         BOOST_LOG(debug) << "Microphone playout prebuffer ready on [" << target_device_name << "] with "
-                         << queued_frames << " queued frames, " << queued_packets << " buffered packets, padding " << padding
+                         << queued_frames << " queued frames, padding " << padding
                          << ", total buffered " << buffered_frames_total << " frames";
-      }
-
-      if (queued_frames == 0) {
-        while (decode_next_packet()) {
-          std::lock_guard lock(queue_mutex);
-          queued_frames = std::min<UINT32>(frames_available, static_cast<UINT32>(pending_frames.size()));
-          if (queued_frames != 0) {
-            break;
-          }
-        }
       }
 
       if (queued_frames == 0) {
@@ -897,12 +806,21 @@ namespace platf::audio {
 
       auto *dst = reinterpret_cast<float *>(buffer);
       {
-        std::lock_guard lock(queue_mutex);
+        std::lock_guard<std::mutex> lock(queue_mutex);
         for (UINT32 frame = 0; frame < queued_frames; ++frame) {
-          const float sample = pending_frames.front();
-          pending_frames.pop_front();
-          dst[static_cast<std::size_t>(frame) * 2] = sample;
-          dst[static_cast<std::size_t>(frame) * 2 + 1] = sample;
+          if (duplicate_to_stereo) {
+            // Client sent mono: duplicate the single channel to both L and R.
+            const float sample = pending_frames.front();
+            pending_frames.pop_front();
+            dst[static_cast<std::size_t>(frame) * 2]     = sample;
+            dst[static_cast<std::size_t>(frame) * 2 + 1] = sample;
+          } else {
+            // Client sent stereo: take L then R interleaved.
+            const float left  = pending_frames.front(); pending_frames.pop_front();
+            const float right = pending_frames.front(); pending_frames.pop_front();
+            dst[static_cast<std::size_t>(frame) * 2]     = left;
+            dst[static_cast<std::size_t>(frame) * 2 + 1] = right;
+          }
         }
       }
 
@@ -942,11 +860,6 @@ namespace platf::audio {
     audio_client.reset();
     device_enum.reset();
 
-    if (opus_decoder != nullptr) {
-      opus_decoder_destroy(opus_decoder);
-      opus_decoder = nullptr;
-    }
-
     active_format_storage.clear();
     buffer_frame_count = 0;
     active_format = {};
@@ -954,12 +867,10 @@ namespace platf::audio {
     first_packet_written_logged = false;
     render_event.reset();
     {
-      std::lock_guard lock(queue_mutex);
-      pending_packets.clear();
+      std::lock_guard<std::mutex> lock(queue_mutex);
       pending_frames.clear();
     }
     expected_sequence_number = 0;
-    expected_timestamp = 0;
     has_playout_cursor = false;
     playout_started = false;
     playout_wait_logged = false;

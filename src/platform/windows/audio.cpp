@@ -813,6 +813,11 @@ namespace platf::audio {
 
       auto try_create_device = [this]() {
         auto device = std::make_unique<apollo_vmic_t>();
+        // Forward the negotiated PCM format before init() so initialize_device()
+        // can set duplicate_to_stereo and log the correct format.
+        if (pending_mic_input_format.sampleRate != 0) {
+          device->set_input_format(pending_mic_input_format);
+        }
         if (device->init() != 0) {
           return false;
         }
@@ -854,6 +859,21 @@ namespace platf::audio {
       }
 
       return mic_redirect_device->write_data(data, len, sequence_number, timestamp);
+    }
+
+    int set_mic_input_format(int sampleRate, int channels, int sampleFormatId, int bitsPerSample, int frameDurationMs) override {
+      platf::audio::mic_input_format_t fmt {};
+      fmt.sampleRate     = sampleRate;
+      fmt.channels       = channels;
+      fmt.sampleFormatId = sampleFormatId;
+      fmt.bytesPerSample = (bitsPerSample + 7) / 8;
+      fmt.frameDurationMs = frameDurationMs;
+      pending_mic_input_format = fmt;
+      // If a device is already active, forward the format directly.
+      if (mic_redirect_device) {
+        mic_redirect_device->set_input_format(fmt);
+      }
+      return 0;
     }
 
     /**
@@ -1244,6 +1264,7 @@ namespace platf::audio {
     std::string assigned_sink;
     std::string active_mic_backend;
     std::unique_ptr<mic_redirect_backend_t> mic_redirect_device;
+    platf::audio::mic_input_format_t pending_mic_input_format {};
   };
 }  // namespace platf::audio
 

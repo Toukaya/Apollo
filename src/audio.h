@@ -155,6 +155,7 @@ namespace audio {
   int init_mic_redirect_device();
   void release_mic_redirect_device();
   int write_mic_data(const char *data, std::size_t len, std::uint16_t sequence_number, std::uint32_t timestamp);
+  int set_mic_input_format(int sampleRate, int channels, int sampleFormatId, int bitsPerSample, int frameDurationMs);
   mic_debug_snapshot_t get_mic_debug_snapshot();
   void mic_debug_on_session_start(const std::string &client_name, bool encryption_enabled);
   void mic_debug_on_session_stop(const std::string &reason = {});

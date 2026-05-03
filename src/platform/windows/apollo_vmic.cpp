@@ -47,6 +47,20 @@ namespace platf::audio {
     return -1;
   }
 
+  void apollo_vmic_t::set_input_format(const mic_input_format_t &fmt) {
+    if (!speaker_backend) {
+      speaker_backend = std::make_unique<mic_write_wasapi_t>(
+        "steam_streaming_microphone",
+        std::vector<std::wstring> {
+          L"Steam Streaming Microphone",
+          L"Speakers (Steam Streaming Microphone)",
+        }
+      );
+    }
+
+    speaker_backend->set_input_format(fmt);
+  }
+
   int apollo_vmic_t::write_data(const char *data, std::size_t len, std::uint16_t sequence_number, std::uint32_t timestamp) {
     if (!speaker_backend) {
       BOOST_LOG(warning) << "Client microphone packet rejected before decode because the Steam Streaming Microphone backend is missing"

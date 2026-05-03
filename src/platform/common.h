@@ -563,6 +563,10 @@ namespace platf {
     virtual void release_mic_redirect_device() = 0;
     virtual int write_mic_data(const char *data, std::size_t len, std::uint16_t sequence_number, std::uint32_t timestamp) = 0;
 
+    // Sets the PCM input format for the microphone redirect path before init_mic_redirect_device().
+    // Default no-op so non-Windows backends compile without change.
+    virtual int set_mic_input_format(int sampleRate, int channels, int sampleFormatId, int bitsPerSample, int frameDurationMs) { return 0; }
+
     /**
      * @brief Check if the audio sink is available in the system.
      * @param sink Sink to be checked.

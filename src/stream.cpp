@@ -1385,7 +1385,7 @@ namespace stream {
       }
 
       auto *header = reinterpret_cast<mic_packet_header_t *>(buf.data());
-      if (header->packetType != MIC_PACKET_TYPE_OPUS || header->ssrc != MIC_PACKET_MAGIC) {
+      if (header->packetType != MIC_PACKET_TYPE_PCM || header->ssrc != MIC_PACKET_MAGIC) {
         continue;
       }
 
@@ -2250,6 +2250,9 @@ namespace stream {
       if (session.audio.enable_mic) {
         audio::mic_debug_on_session_start(session.device_name, (session.config.encryptionFlagsEnabled & SS_ENC_MICROPHONE) != 0);
         if (running_mic_sessions.fetch_add(1, std::memory_order_acq_rel) == 0) {
+          // Inform the backend of the PCM format that was advertised in SDP before initializing.
+          // These values must match what cmd_describe emitted in the a=fmtp:97 line.
+          audio::set_mic_input_format(48000, 1, LI_MIC_FMT_S16LE, 16, 10);
           if (audio::init_mic_redirect_device() != 0) {
             running_mic_sessions.fetch_sub(1, std::memory_order_acq_rel);
             session.audio.enable_mic = false;

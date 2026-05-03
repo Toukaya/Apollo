@@ -835,9 +835,35 @@ namespace rtsp_stream {
     }
 
     if (config::audio.stream_mic) {
-      ss << "m=audio " << net::map_port(stream::MIC_STREAM_PORT) << " RTP/AVP 96" << std::endl;
-      ss << "a=rtpmap:96 opus/48000/1"sv << std::endl;
-      ss << "a=fmtp:96 minptime=10;useinbandfec=1"sv << std::endl;
+      // PCM mic format defaults: 48 kHz, mono, 16-bit signed little-endian.
+      // frameDurationMs is selected as the largest value in {10, 5, 2} ms such
+      // that the wire payload fits within MAX_MIC_PACKET_SIZE (1400 bytes):
+      //   payloadBytes = sampleRate * channels * bytesPerSample * frameDurationMs / 1000
+      //   payloadBytes + 12 (header) + 16 (AES-CBC pad worst-case) <= 1400
+      constexpr int mic_sample_rate = 48000;
+      constexpr int mic_channels = 1;
+      constexpr int mic_bits_per_sample = 16;
+      constexpr int mic_budget = MAX_MIC_PACKET_SIZE - 12 - 16; // 1372 bytes
+      const int mic_bytes_per_ms = mic_sample_rate * mic_channels * (mic_bits_per_sample / 8) / 1000;
+      int mic_frame_duration_ms = 0;
+      for (int candidate : {10, 5, 2}) {
+        if (mic_bytes_per_ms * candidate <= mic_budget) {
+          mic_frame_duration_ms = candidate;
+          break;
+        }
+      }
+      if (mic_frame_duration_ms == 0) {
+        BOOST_LOG(warning) << "PCM mic frame size exceeds MTU even at 2 ms; microphone SDP not emitted";
+      } else {
+        ss << "m=audio " << net::map_port(stream::MIC_STREAM_PORT) << " RTP/AVP 97" << std::endl;
+        ss << "a=rtpmap:97 L16/" << mic_sample_rate << "/" << mic_channels << std::endl;
+        ss << "a=fmtp:97 x-ml-mic.sampleRate=" << mic_sample_rate
+           << ";x-ml-mic.channels=" << mic_channels
+           << ";x-ml-mic.bitsPerSample=" << mic_bits_per_sample
+           << ";x-ml-mic.sampleFormat=s16le"
+           << ";x-ml-mic.frameDurationMs=" << mic_frame_duration_ms
+           << ";x-ml-mic.transport=pcm" << std::endl;
+      }
     }
 
     for (int x = 0; x < audio::MAX_STREAM_CONFIG; ++x) {

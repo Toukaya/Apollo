@@ -357,6 +357,17 @@ namespace audio {
     return ref->control->write_mic_data(data, len, sequence_number, timestamp);
   }
 
+  int set_mic_input_format(int sampleRate, int channels, int sampleFormatId, int bitsPerSample, int frameDurationMs) {
+    auto &held_ref = mic_redirect_audio_ctx();
+    auto ref = held_ref ? held_ref : get_audio_ctx_ref();
+    if (!ref || !ref->control) {
+      BOOST_LOG(warning) << "set_mic_input_format: audio control unavailable";
+      return -1;
+    }
+
+    return ref->control->set_mic_input_format(sampleRate, channels, sampleFormatId, bitsPerSample, frameDurationMs);
+  }
+
   mic_debug_snapshot_t get_mic_debug_snapshot() {
     auto &state = mic_debug_state();
     std::lock_guard lock(state.mutex);
