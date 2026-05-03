@@ -21,9 +21,13 @@ The fork adds the following on top of upstream Apollo:
 - `CMakeLists.txt` `project(Apollo VERSION ...)` set to **0.4.7** (claiming the version that upstream skipped between v0.4.7-alpha.1 and v0.4.8); annotated git tag `v0.4.7` exists.
 - `src/main.cpp` emits an extra startup banner line: `[Toukaya PCM-mic fork] mic ingest = raw PCM via SDP a=fmtp:97 x-ml-mic.* (Opus mic path removed)` so a running binary is unambiguously identifiable.
 
-### enet pinned to 115a10b (empirical known-good)
+### enet pinned to 115a10b
 
-The bundled `moonlight-common-c/enet` sub-submodule is held at `115a10b` rather than the newer `c7353c0`. This is an empirical "known-good" pin, not a fix for a known upstream bug. The three commits in the upgrade range — `c7353c0` (lowercase Windows include casing), `78cc9b4` (gates `localAddress` source-hint on wildcard bind), `dea6fb5` (FreeBSD-only) — are all functional no-ops on Apollo's wildcard-bound (`0.0.0.0` / `::`) Windows enet host. Earlier debugging in this fork tentatively associated the upgrade with mic distortion, but that finding was later shown to be confounded with stale ninja link-time artifacts; once a forced full clean rebuild is performed, the buzz disappears regardless of which enet pointer is in use. The pin is kept until a future clean-rebuild test on `c7353c0` confirms parity, at which point it can be lifted.
+The bundled `moonlight-common-c/enet` sub-submodule is held at `115a10b` rather than the newer `c7353c0`. The actual reason: enet `78cc9b4` (in the upgrade range) inserts a new `int wildcardBind` field between `socket` and `address` in the public `_ENetHost` struct, shifting the byte offset of every subsequent field. This is a **silent ABI break** — enet did not bump SONAME or document the change as binary-incompatible.
+
+Apollo dereferences `_ENetHost` members directly in `src/network.cpp` (`host->peers`, `host->peerCount`). If any translation unit in the Apollo binary sees one struct layout while another sees the other (which is exactly what happens during incremental rebuilds across an enet bump, because compiler-generated depfiles do not detect struct-layout changes), the offset mismatch corrupts heap memory near the ENetHost — manifesting as intermittent mic distortion, audio buffer corruption, or other subtle runtime defects that *look* like a streaming protocol bug.
+
+Either layout is fine in isolation; the failure mode is the *mismatch*. The 115a10b pin enforces consistency by holding the layout stable across moonlight-common-c syncs. Lifting the pin is safe given a forced full clean rebuild (`rm -rf build/` + fresh `cmake -B build` + full link); avoid lifting it casually as part of a larger sync. A future enhancement: add a `static_assert(sizeof(ENetHost) == ...)` at build time to fail fast if a future enet update grows the struct again.
 
 Major features:
 
