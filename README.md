@@ -21,13 +21,15 @@ The fork adds the following on top of upstream Apollo:
 - `CMakeLists.txt` `project(Apollo VERSION ...)` set to **0.4.7** (claiming the version that upstream skipped between v0.4.7-alpha.1 and v0.4.8); annotated git tag `v0.4.7` exists.
 - `src/main.cpp` emits an extra startup banner line: `[Toukaya PCM-mic fork] mic ingest = raw PCM via SDP a=fmtp:97 x-ml-mic.* (Opus mic path removed)` so a running binary is unambiguously identifiable.
 
-### enet pinned to 115a10b
+### Build discipline: clean rebuild required across enet bumps
 
-The bundled `moonlight-common-c/enet` sub-submodule is held at `115a10b` rather than the newer `c7353c0`. The actual reason: enet `78cc9b4` (in the upgrade range) inserts a new `int wildcardBind` field between `socket` and `address` in the public `_ENetHost` struct, shifting the byte offset of every subsequent field. This is a **silent ABI break** — enet did not bump SONAME or document the change as binary-incompatible.
+The bundled `moonlight-common-c/enet` sub-submodule tracks upstream (currently `c7353c0`). Note: enet `78cc9b4` inserts a new `int wildcardBind` field between `socket` and `address` in the public `_ENetHost` struct, shifting the byte offset of every subsequent field. This is a **silent ABI break** — enet did not bump SONAME or document the change as binary-incompatible.
 
-Apollo dereferences `_ENetHost` members directly in `src/network.cpp` (`host->peers`, `host->peerCount`). If any translation unit in the Apollo binary sees one struct layout while another sees the other (which is exactly what happens during incremental rebuilds across an enet bump, because compiler-generated depfiles do not detect struct-layout changes), the offset mismatch corrupts heap memory near the ENetHost — manifesting as intermittent mic distortion, audio buffer corruption, or other subtle runtime defects that *look* like a streaming protocol bug.
+Apollo dereferences `_ENetHost` fields in `src/network.cpp::free_host` (`host->peers`, `host->peerCount`). The dereference is on the shutdown path only, so the most concrete consequence of an ABI mismatch is heap corruption at process exit. During fork bring-up an intermittent runtime mic-quality issue was also observed and disappeared with a forced full clean rebuild; whether that specific symptom was caused by this ABI mismatch or by some other stale build artifact was not isolated, but the cure is identical either way.
 
-Either layout is fine in isolation; the failure mode is the *mismatch*. The 115a10b pin enforces consistency by holding the layout stable across moonlight-common-c syncs. Lifting the pin is safe given a forced full clean rebuild (`rm -rf build/` + fresh `cmake -B build` + full link); avoid lifting it casually as part of a larger sync. A future enhancement: add a `static_assert(sizeof(ENetHost) == ...)` at build time to fail fast if a future enet update grows the struct again.
+**Concrete rule**: after any submodule pointer move that crosses an enet boundary (or any other public C struct change in vendored code), do `rm -rf build/` + fresh `cmake -B build` + full link. Do not trust ninja's incremental dep tracker for ABI-affecting source changes — compiler-generated depfiles do not encode struct-layout invariants. Both `115a10b` and `c7353c0` are individually fine; only mixing object files compiled against the two layouts is harmful.
+
+Future enhancement: add `static_assert(sizeof(ENetHost) == EXPECTED)` so a future enet update that silently grows the struct fails the build instead of producing a miscompiled binary.
 
 Major features:
 
