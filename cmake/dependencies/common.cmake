@@ -33,8 +33,12 @@ if(NOT DEFINED FFMPEG_PREPARED_BINARIES)
     elseif(UNIX AND NOT APPLE)
         set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
     endif()
+    set(_ffmpeg_proc "${CMAKE_SYSTEM_PROCESSOR}")
+    if(NOT _ffmpeg_proc AND WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_ffmpeg_proc "AMD64")
+    endif()
     set(FFMPEG_PREPARED_BINARIES
-            "${CMAKE_SOURCE_DIR}/third-party/build-deps/dist/${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+            "${CMAKE_SOURCE_DIR}/third-party/build-deps/dist/${CMAKE_SYSTEM_NAME}-${_ffmpeg_proc}")
 
     # check if the directory exists
     if(NOT EXISTS "${FFMPEG_PREPARED_BINARIES}")
