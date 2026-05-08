@@ -5,6 +5,8 @@
 #include <initguid.h>
 #include <combaseapi.h>
 #include <thread>
+#include <fstream>
+#include <string>
 
 #include <wrl/client.h>
 #include <dxgi.h>
@@ -17,6 +19,153 @@
 using namespace SUDOVDA;
 
 namespace VDISPLAY {
+
+// ===== Persistent VD GUID tracking (orphan-sweep helpers) =====
+// We persist the GUID of every successfully created virtual display to a small
+// text file under %LOCALAPPDATA%\Apollo\active_vds.txt and remove it from the
+// file once the VD is removed. On startup we walk the file and try to remove
+// any leftover GUIDs (orphans from prior abnormal terminations).
+
+static std::wstring getActiveVdsFilePath() {
+	const wchar_t* localAppData = _wgetenv(L"LOCALAPPDATA");
+	if (!localAppData || !*localAppData) {
+		return std::wstring();
+	}
+
+	std::wstring dir = std::wstring(localAppData) + L"\\Apollo";
+	// CreateDirectoryW returns nonzero on success; if it already exists the
+	// last error is ERROR_ALREADY_EXISTS, which is fine.
+	CreateDirectoryW(dir.c_str(), NULL);
+
+	return dir + L"\\active_vds.txt";
+}
+
+static std::wstring guidToWString(const GUID& guid) {
+	wchar_t buf[64] = {};
+	// {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} -> 38 chars + NUL
+	swprintf(buf, 64,
+		L"{%08lX-%04hX-%04hX-%02hhX%02hhX-%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX}",
+		guid.Data1, guid.Data2, guid.Data3,
+		guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+		guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+	return std::wstring(buf);
+}
+
+static void appendActiveVdGuid(const GUID& guid) {
+	std::wstring path = getActiveVdsFilePath();
+	if (path.empty()) {
+		return;
+	}
+
+	std::wofstream f(path.c_str(), std::ios::app);
+	if (!f.is_open()) {
+		printf("[SUDOVDA] Failed to open active_vds.txt for append.\n");
+		return;
+	}
+
+	f << guidToWString(guid) << L"\n";
+}
+
+static void removeActiveVdGuid(const GUID& guid) {
+	std::wstring path = getActiveVdsFilePath();
+	if (path.empty()) {
+		return;
+	}
+
+	std::wstring target = guidToWString(guid);
+
+	std::vector<std::wstring> kept;
+	{
+		std::wifstream in(path.c_str());
+		if (!in.is_open()) {
+			return;
+		}
+		std::wstring line;
+		while (std::getline(in, line)) {
+			// strip trailing \r if present
+			if (!line.empty() && line.back() == L'\r') {
+				line.pop_back();
+			}
+			if (line.empty()) {
+				continue;
+			}
+			if (line != target) {
+				kept.push_back(line);
+			}
+		}
+	}
+
+	std::wofstream out(path.c_str(), std::ios::trunc);
+	if (!out.is_open()) {
+		return;
+	}
+	for (const auto& l : kept) {
+		out << l << L"\n";
+	}
+}
+
+static void sweepOrphanVds() {
+	std::wstring path = getActiveVdsFilePath();
+	if (path.empty()) {
+		return;
+	}
+
+	std::vector<std::wstring> lines;
+	{
+		std::wifstream in(path.c_str());
+		if (!in.is_open()) {
+			// No file means nothing to sweep -- normal first-run case.
+			return;
+		}
+		std::wstring line;
+		while (std::getline(in, line)) {
+			if (!line.empty() && line.back() == L'\r') {
+				line.pop_back();
+			}
+			if (!line.empty()) {
+				lines.push_back(line);
+			}
+		}
+	}
+
+	if (lines.empty()) {
+		return;
+	}
+
+	printf("[SUDOVDA] Orphan VD sweep: %zu candidate GUID(s) found.\n", lines.size());
+
+	for (const auto& line : lines) {
+		GUID guid {};
+		// IIDFromString expects the canonical {GUID} form, which is what we wrote.
+		HRESULT hr = IIDFromString(line.c_str(), &guid);
+		if (FAILED(hr)) {
+			wprintf(L"[SUDOVDA] Orphan sweep: failed to parse GUID line '%ls' (hr=0x%lx). Skipping.\n", line.c_str(), hr);
+			continue;
+		}
+
+		if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
+			printf("[SUDOVDA] Orphan sweep: driver handle invalid, aborting sweep.\n");
+			break;
+		}
+
+		if (RemoveVirtualDisplay(SUDOVDA_DRIVER_HANDLE, guid)) {
+			wprintf(L"[SUDOVDA] Orphan sweep: removed leftover VD %ls\n", line.c_str());
+		} else {
+			// Failures are expected and non-fatal: the VD may already be gone,
+			// the driver may be transitioning, etc. Just log at info level.
+			wprintf(L"[SUDOVDA] Orphan sweep: VD %ls already absent or remove failed (non-fatal).\n", line.c_str());
+		}
+	}
+
+	// Truncate -- whether the removals succeeded or not, we don't want to keep
+	// retrying these GUIDs on every startup. New VDs created after this point
+	// will repopulate the file via appendActiveVdGuid().
+	std::wofstream out(path.c_str(), std::ios::trunc);
+	(void)out;
+}
+// ===== End persistent VD GUID tracking =====
+
+
 // {dff7fd29-5b75-41d1-9731-b32a17a17104}
 // static const GUID DEFAULT_DISPLAY_GUID = { 0xdff7fd29, 0x5b75, 0x41d1, { 0x97, 0x31, 0xb3, 0x2a, 0x17, 0xa1, 0x71, 0x04 } };
 
@@ -582,6 +731,10 @@ DRIVER_STATUS openVDisplayDevice() {
 		return DRIVER_STATUS::VERSION_INCOMPATIBLE;
 	}
 
+	// Sweep any orphaned virtual displays left over from prior abnormal
+	// shutdowns. Failures here must not block startup.
+	sweepOrphanVds();
+
 	return DRIVER_STATUS::OK;
 }
 
@@ -671,6 +824,10 @@ std::wstring createVirtualDisplay(
 		return std::wstring();
 	}
 
+	// Persist the GUID so we can clean it up later even if Apollo is killed
+	// before it has a chance to call removeVirtualDisplay().
+	appendActiveVdGuid(guid);
+
 	uint32_t retryInterval = 20;
 	wchar_t deviceName[CCHDEVICENAME]{};
 	while (!GetAddedDisplayName(output, deviceName)) {
@@ -695,6 +852,7 @@ bool removeVirtualDisplay(const GUID& guid) {
 
 	if (RemoveVirtualDisplay(SUDOVDA_DRIVER_HANDLE, guid)) {
 		printf("[SUDOVDA] Virtual display removed successfully.\n");
+		removeActiveVdGuid(guid);
 		return true;
 	} else {
 		return false;
