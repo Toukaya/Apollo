@@ -77,5 +77,17 @@ namespace platf::audio {
     bool playout_wait_logged = false;
     mic_input_format_t input_format;
     bool duplicate_to_stereo = false;
+
+    // Endpoint device IDs whose WASAPI format we mutated during
+    // initialize_device(). cleanup() revisits each on teardown to restore the
+    // pre-Apollo format. See mic_write.cpp for the persistence design.
+    std::vector<std::wstring> mutated_device_ids;
   };
+
+  // Revert any Steam Streaming Microphone format mutations that were persisted
+  // to %LOCALAPPDATA%\Apollo\steam_mic_prev_format.bin but never cleaned up by
+  // a prior Apollo process. Safe to call from process startup before any
+  // streaming session begins; it requires a COM apartment to already be
+  // initialized.
+  void sweep_orphan_steam_mic_formats();
 }  // namespace platf::audio

@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <fstream>
+#include <ios>
 #include <string_view>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
 #include <synchapi.h>
+#include <windows.h>
 
 #include "PolicyConfig.h"
 #include "misc.h"
@@ -269,7 +272,226 @@ namespace platf::audio {
       return info;
     }
 
-    bool ensure_recommended_steam_mic_format(const std::wstring &device_id, const std::string &target_device_name, EDataFlow flow) {
+    // ===== Persistent Steam mic prev-format tracking =====
+    //
+    // ensure_recommended_steam_mic_format() mutates the WASAPI endpoint format
+    // of the Steam Streaming Microphone device(s) to the Apollo-required
+    // 48 kHz / stereo / 32-bit format. Without persistence, an abnormal exit
+    // (SIGKILL, host crash, power loss) leaves the device stuck at this
+    // format forever. We persist (device_id -> previous WAVEFORMATEX bytes)
+    // records to %LOCALAPPDATA%\Apollo\steam_mic_prev_format.bin so that:
+    //   1. Normal cleanup can restore the original format and remove the
+    //      record from the file.
+    //   2. The next Apollo startup can sweep the file and revert any
+    //      orphan mutations left over from a prior abnormal exit.
+    //
+    // File layout (binary, little-endian, repeated per record):
+    //   uint32_t  device_id_wchar_count   (number of WCHARs, no NUL)
+    //   WCHAR     device_id[device_id_wchar_count]
+    //   uint32_t  format_byte_count
+    //   uint8_t   format_bytes[format_byte_count]
+    //
+    // The format_bytes hold a verbatim WAVEFORMATEX (or WAVEFORMATEXTENSIBLE,
+    // or any larger driver-defined extension) of size sizeof(WAVEFORMATEX) +
+    // WAVEFORMATEX::cbSize. They are passed back to IPolicyConfig::SetDeviceFormat
+    // unchanged on revert.
+    //
+    // A 4-byte file magic "APMF" prefixes the file so we can reject corrupt
+    // or future-format files without misinterpreting bytes as record sizes.
+
+    constexpr std::uint32_t k_steam_mic_prev_format_magic = 0x464D5041;  // 'APMF' little-endian
+
+    struct prev_format_entry_t {
+      std::wstring device_id;
+      std::vector<BYTE> format_bytes;
+    };
+
+    std::wstring get_prev_format_file_path() {
+      const wchar_t *local_app_data = _wgetenv(L"LOCALAPPDATA");
+      if (!local_app_data || !*local_app_data) {
+        return std::wstring();
+      }
+
+      std::wstring dir = std::wstring(local_app_data) + L"\\Apollo";
+      // CreateDirectoryW returns nonzero on success; if it already exists the
+      // last error is ERROR_ALREADY_EXISTS, which is fine.
+      CreateDirectoryW(dir.c_str(), nullptr);
+
+      return dir + L"\\steam_mic_prev_format.bin";
+    }
+
+    template<typename T>
+    bool read_pod(std::ifstream &f, T &out) {
+      f.read(reinterpret_cast<char *>(&out), sizeof(T));
+      return f.good();
+    }
+
+    template<typename T>
+    void write_pod(std::ofstream &f, const T &v) {
+      f.write(reinterpret_cast<const char *>(&v), sizeof(T));
+    }
+
+    std::vector<prev_format_entry_t> load_all_prev_format_entries() {
+      std::vector<prev_format_entry_t> entries;
+
+      std::wstring path = get_prev_format_file_path();
+      if (path.empty()) {
+        return entries;
+      }
+
+      std::ifstream f(path.c_str(), std::ios::binary);
+      if (!f.is_open()) {
+        return entries;
+      }
+
+      std::uint32_t magic = 0;
+      if (!read_pod(f, magic) || magic != k_steam_mic_prev_format_magic) {
+        // Missing or wrong magic. Treat as no entries (and the file will be
+        // overwritten next time we successfully append).
+        return entries;
+      }
+
+      while (f.peek() != EOF) {
+        std::uint32_t id_wchar_count = 0;
+        if (!read_pod(f, id_wchar_count)) {
+          break;
+        }
+        // Sanity bound to refuse pathological files. Device IDs are typically
+        // shorter than 256 WCHARs.
+        if (id_wchar_count == 0 || id_wchar_count > 4096) {
+          break;
+        }
+
+        std::wstring device_id;
+        device_id.resize(id_wchar_count);
+        f.read(reinterpret_cast<char *>(device_id.data()),
+               static_cast<std::streamsize>(id_wchar_count) * sizeof(wchar_t));
+        if (!f.good()) {
+          break;
+        }
+
+        std::uint32_t fmt_byte_count = 0;
+        if (!read_pod(f, fmt_byte_count)) {
+          break;
+        }
+        if (fmt_byte_count < sizeof(WAVEFORMATEX) || fmt_byte_count > 65536) {
+          break;
+        }
+
+        std::vector<BYTE> fmt_bytes(fmt_byte_count);
+        f.read(reinterpret_cast<char *>(fmt_bytes.data()),
+               static_cast<std::streamsize>(fmt_byte_count));
+        if (!f.good()) {
+          break;
+        }
+
+        entries.push_back({std::move(device_id), std::move(fmt_bytes)});
+      }
+
+      return entries;
+    }
+
+    bool write_all_prev_format_entries(const std::vector<prev_format_entry_t> &entries) {
+      std::wstring path = get_prev_format_file_path();
+      if (path.empty()) {
+        return false;
+      }
+
+      // std::ios::trunc rewrites the file from scratch -- there is no append
+      // semantic for a header+record format. Callers are expected to load,
+      // mutate, and rewrite in one go.
+      std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
+      if (!f.is_open()) {
+        return false;
+      }
+
+      write_pod(f, k_steam_mic_prev_format_magic);
+
+      for (const auto &e : entries) {
+        const std::uint32_t id_wchar_count = static_cast<std::uint32_t>(e.device_id.size());
+        write_pod(f, id_wchar_count);
+        f.write(reinterpret_cast<const char *>(e.device_id.data()),
+                static_cast<std::streamsize>(id_wchar_count) * sizeof(wchar_t));
+
+        const std::uint32_t fmt_byte_count = static_cast<std::uint32_t>(e.format_bytes.size());
+        write_pod(f, fmt_byte_count);
+        f.write(reinterpret_cast<const char *>(e.format_bytes.data()),
+                static_cast<std::streamsize>(fmt_byte_count));
+      }
+
+      return f.good();
+    }
+
+    void append_prev_format_entry(const std::wstring &device_id, const std::vector<BYTE> &format_bytes) {
+      auto entries = load_all_prev_format_entries();
+
+      // If the device already has a recorded prev format, do not overwrite it.
+      // The earliest captured prev format is the one that should be restored;
+      // a later capture would just record our already-mutated format.
+      for (const auto &e : entries) {
+        if (e.device_id == device_id) {
+          return;
+        }
+      }
+
+      entries.push_back({device_id, format_bytes});
+      if (!write_all_prev_format_entries(entries)) {
+        BOOST_LOG(warning) << "Couldn't persist Steam microphone prev-format record for device";
+      }
+    }
+
+    void remove_prev_format_entry(const std::wstring &device_id) {
+      auto entries = load_all_prev_format_entries();
+
+      const auto before = entries.size();
+      entries.erase(
+        std::remove_if(entries.begin(), entries.end(),
+                       [&device_id](const prev_format_entry_t &e) {
+                         return e.device_id == device_id;
+                       }),
+        entries.end());
+
+      if (entries.size() != before) {
+        write_all_prev_format_entries(entries);
+      }
+    }
+
+    // Apply a previously-recorded format back onto a device via IPolicyConfig.
+    // Returns true on success.
+    bool restore_device_format(IPolicyConfig *policy,
+                               const std::wstring &device_id,
+                               const std::vector<BYTE> &format_bytes) {
+      if (policy == nullptr || format_bytes.size() < sizeof(WAVEFORMATEX)) {
+        return false;
+      }
+
+      // SetDeviceFormat takes a non-const WAVEFORMATEX*. Make a writable copy
+      // so we don't violate the const-ness of the input vector.
+      std::vector<BYTE> mutable_bytes = format_bytes;
+      auto *fmt = reinterpret_cast<WAVEFORMATEX *>(mutable_bytes.data());
+
+      WAVEFORMATEXTENSIBLE discarded {};
+      HRESULT hr = policy->SetDeviceFormat(
+        device_id.c_str(),
+        fmt,
+        reinterpret_cast<WAVEFORMATEX *>(&discarded));
+      return SUCCEEDED(hr);
+    }
+    // ===== End persistent Steam mic prev-format tracking =====
+
+    // ensure_recommended_steam_mic_format returns true if the device is at the
+    // recommended format after this call (whether because it already was or
+    // because we changed it). If out_did_mutate is non-null, it is set to true
+    // ONLY when this call actually changed the device format -- callers use
+    // that signal to know when they need to revert on cleanup.
+    bool ensure_recommended_steam_mic_format(const std::wstring &device_id,
+                                             const std::string &target_device_name,
+                                             EDataFlow flow,
+                                             bool *out_did_mutate = nullptr) {
+      if (out_did_mutate != nullptr) {
+        *out_did_mutate = false;
+      }
+
       policy_t policy;
       auto status = CoCreateInstance(
         CLSID_CPolicyConfigClient,
@@ -296,6 +518,13 @@ namespace platf::audio {
         return true;
       }
 
+      // Capture the full previous format (including any driver-specific tail
+      // bytes) so we can restore it later. cbSize on a WAVEFORMATEX includes
+      // only the bytes after the base struct.
+      const std::size_t prev_format_size = sizeof(WAVEFORMATEX) + current_format->cbSize;
+      std::vector<BYTE> previous_format_bytes(prev_format_size);
+      std::memcpy(previous_format_bytes.data(), current_format.get(), prev_format_size);
+
       auto recommended_format_storage = make_recommended_steam_mic_device_waveformat();
       auto *recommended_format = reinterpret_cast<WAVEFORMATEX *>(recommended_format_storage.data());
       WAVEFORMATEXTENSIBLE previous_format {};
@@ -307,8 +536,63 @@ namespace platf::audio {
         return false;
       }
 
+      // Persist the prev format so that an abnormal Apollo exit (or a missed
+      // cleanup path) can be recovered from the next time Apollo starts up.
+      // Always persist before we report success: if persistence fails we still
+      // attempt to revert in cleanup() via the in-memory member tracking, but
+      // we lose the orphan-sweep guarantee.
+      append_prev_format_entry(device_id, previous_format_bytes);
+
+      if (out_did_mutate != nullptr) {
+        *out_did_mutate = true;
+      }
+
       BOOST_LOG(info) << "Changed Steam microphone " << to_utf8(endpoint_label(flow)) << " device format for [" << target_device_name
                       << "] to [pcm, 32-bit, 48000 Hz, 2ch]";
+      return true;
+    }
+
+    // Try to revert the format mutation for a single device_id using the
+    // persisted prev-format file. Returns true if a record was found AND the
+    // SetDeviceFormat call succeeded (in which case the record is removed
+    // from the file). Returns false on any failure or missing record.
+    bool revert_steam_mic_format_for_device(const std::wstring &device_id) {
+      if (device_id.empty()) {
+        return false;
+      }
+
+      auto entries = load_all_prev_format_entries();
+      const prev_format_entry_t *match = nullptr;
+      for (const auto &e : entries) {
+        if (e.device_id == device_id) {
+          match = &e;
+          break;
+        }
+      }
+      if (match == nullptr) {
+        return false;
+      }
+
+      policy_t policy;
+      HRESULT hr = CoCreateInstance(
+        CLSID_CPolicyConfigClient,
+        nullptr,
+        CLSCTX_ALL,
+        IID_IPolicyConfig,
+        reinterpret_cast<void **>(&policy));
+      if (FAILED(hr) || !policy) {
+        BOOST_LOG(warning) << "Couldn't create audio policy config to revert Steam microphone format: 0x"
+                           << util::hex(hr).to_string_view();
+        return false;
+      }
+
+      if (!restore_device_format(policy.get(), device_id, match->format_bytes)) {
+        BOOST_LOG(warning) << "Couldn't restore Steam microphone format for device (SetDeviceFormat failed)";
+        return false;
+      }
+
+      remove_prev_format_entry(device_id);
+      BOOST_LOG(info) << "Restored Steam microphone device format from persisted record";
       return true;
     }
 
@@ -492,8 +776,16 @@ namespace platf::audio {
       return false;
     }
 
-    const bool render_format_enforced = ensure_recommended_steam_mic_format(render_device_id, target_device_name, eRender);
-    const bool capture_format_enforced = ensure_recommended_steam_mic_format(capture_device_id, capture_device_name, eCapture);
+    bool render_did_mutate = false;
+    const bool render_format_enforced = ensure_recommended_steam_mic_format(render_device_id, target_device_name, eRender, &render_did_mutate);
+    if (render_did_mutate) {
+      mutated_device_ids.push_back(render_device_id);
+    }
+    bool capture_did_mutate = false;
+    const bool capture_format_enforced = ensure_recommended_steam_mic_format(capture_device_id, capture_device_name, eCapture, &capture_did_mutate);
+    if (capture_did_mutate) {
+      mutated_device_ids.push_back(capture_device_id);
+    }
     const auto render_endpoint_info = query_endpoint_format_info(device_enum.get(), render_device_id);
     const auto capture_endpoint_info = query_endpoint_format_info(device_enum.get(), capture_device_id);
     const bool recommended_format_active = render_endpoint_info.recommended_active && capture_endpoint_info.recommended_active;
@@ -860,6 +1152,21 @@ namespace platf::audio {
     audio_client.reset();
     device_enum.reset();
 
+    // Revert any device-format mutations performed during initialize_device.
+    // Each successful revert removes the corresponding entry from the
+    // persistence file so the startup sweep won't try to revert again.
+    // We iterate even if revert fails -- next startup will retry via the
+    // sweep.
+    for (const auto &device_id : mutated_device_ids) {
+      if (revert_steam_mic_format_for_device(device_id)) {
+        BOOST_LOG(info) << "Reverted Steam microphone device format on cleanup";
+      } else {
+        BOOST_LOG(warning) << "Couldn't revert Steam microphone device format on cleanup -- "
+                              "startup sweep will retry on next launch";
+      }
+    }
+    mutated_device_ids.clear();
+
     active_format_storage.clear();
     buffer_frame_count = 0;
     active_format = {};
@@ -874,5 +1181,51 @@ namespace platf::audio {
     has_playout_cursor = false;
     playout_started = false;
     playout_wait_logged = false;
+  }
+
+  // Public startup sweep: revert any Steam Streaming Microphone format
+  // mutations that were persisted but never cleaned up (e.g. because the
+  // previous Apollo process was killed before it could revert). This is the
+  // belt-and-suspenders fallback: it catches abnormal-exit cases where the
+  // mic_write_wasapi_t::cleanup() path never ran.
+  void sweep_orphan_steam_mic_formats() {
+    auto entries = load_all_prev_format_entries();
+    if (entries.empty()) {
+      return;
+    }
+
+    BOOST_LOG(info) << "Steam microphone format orphan sweep: " << entries.size()
+                    << " candidate entry/entries found.";
+
+    policy_t policy;
+    HRESULT hr = CoCreateInstance(
+      CLSID_CPolicyConfigClient,
+      nullptr,
+      CLSCTX_ALL,
+      IID_IPolicyConfig,
+      reinterpret_cast<void **>(&policy));
+    if (FAILED(hr) || !policy) {
+      BOOST_LOG(warning) << "Steam microphone format orphan sweep: failed to create policy config: 0x"
+                         << util::hex(hr).to_string_view();
+      return;
+    }
+
+    // Keep entries we couldn't restore (e.g. device temporarily disconnected,
+    // transient COM failure) so a later Apollo launch with a healthier system
+    // state can retry. Drop only the entries we successfully restored.
+    std::vector<prev_format_entry_t> remaining;
+    remaining.reserve(entries.size());
+    for (auto &e : entries) {
+      if (restore_device_format(policy.get(), e.device_id, e.format_bytes)) {
+        BOOST_LOG(info) << "Steam microphone format orphan sweep: restored device format";
+      } else {
+        BOOST_LOG(warning) << "Steam microphone format orphan sweep: SetDeviceFormat failed for an entry; "
+                              "keeping record for retry on next launch.";
+        remaining.push_back(std::move(e));
+      }
+    }
+
+    // Rewrite the file with only the entries that still need to be restored.
+    write_all_prev_format_entries(remaining);
   }
 }  // namespace platf::audio

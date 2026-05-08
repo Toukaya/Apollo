@@ -1302,6 +1302,11 @@ namespace platf {
     // Initialize COM
     auto co_init = std::make_unique<platf::audio::co_init_t>();
 
+    // Revert any Steam Streaming Microphone WASAPI format mutations left over
+    // from a prior abnormal Apollo termination. Must run after COM init and
+    // before any streaming session can re-mutate the device format.
+    platf::audio::sweep_orphan_steam_mic_formats();
+
     // If Steam Streaming Speakers are currently the default audio device,
     // change the default to something else (if another device is available).
     audio::audio_control_t audio_ctrl;
