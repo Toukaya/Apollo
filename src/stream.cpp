@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <atomic>
 #include <fstream>
 #include <future>
 #include <queue>
@@ -378,6 +379,15 @@ namespace stream {
 
       int lowseq;
       udp::endpoint peer;
+
+      // Count of video shards the socket accepted, and of send calls that failed.
+      // The session housekeeping loop reads shards_sent to detect a stalled video path.
+      std::atomic<std::uint64_t> shards_sent;
+      std::atomic<std::uint64_t> send_failures;
+
+      // Watchdog state. Only the control broadcast thread touches these fields.
+      std::uint64_t watchdog_last_failures;
+      std::chrono::steady_clock::time_point watchdog_failing_since;
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
@@ -1160,6 +1170,33 @@ namespace stream {
             session::stop(*session);
           }
 
+          // Video send watchdog. platf::send() reports a failed datagram, but the
+          // broadcast thread cannot act on it. The encoder and the control ping keep
+          // the session alive, so a video path that only fails looks healthy and needs
+          // a service restart to clear. Stop the session instead, and let the client
+          // reconnect.
+          if (config::stream.video_stall_timeout.count() > 0 &&
+              session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
+            std::uint64_t failures = session->video.send_failures.load(std::memory_order_relaxed);
+            if (failures > session->video.watchdog_last_failures) {
+              if (session->video.watchdog_failing_since == std::chrono::steady_clock::time_point::min()) {
+                session->video.watchdog_failing_since = now;
+              }
+              session->video.watchdog_last_failures = failures;
+            } else {
+              session->video.watchdog_failing_since = std::chrono::steady_clock::time_point::min();
+            }
+
+            if (session->video.watchdog_failing_since != std::chrono::steady_clock::time_point::min() &&
+                now - session->video.watchdog_failing_since > config::stream.video_stall_timeout) {
+              BOOST_LOG(error) << "Video send failing for "sv
+                               << std::chrono::duration_cast<std::chrono::seconds>(now - session->video.watchdog_failing_since).count()
+                               << "s ["sv << failures << " failed sends, "sv
+                               << session->video.shards_sent.load(std::memory_order_relaxed) << " sent], stopping the session"sv;
+              session::stop(*session);
+            }
+          }
+
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
             pos = server->_sessions->erase(pos);
 
@@ -1716,8 +1753,15 @@ namespace stream {
                     session->localAddress,
                   };
 
-                  platf::send(send_info);
+                  if (platf::send(send_info)) {
+                    session->video.shards_sent.fetch_add(1, std::memory_order_relaxed);
+                  } else {
+                    session->video.send_failures.fetch_add(1, std::memory_order_relaxed);
+                  }
                 }
+              }
+              else {
+                session->video.shards_sent.fetch_add(current_batch_size, std::memory_order_relaxed);
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
 
@@ -1750,6 +1794,10 @@ namespace stream {
         std::this_thread::sleep_for(100ms);
       }
     }
+
+    // This thread raises broadcast_shutdown on exit, which tears down the whole
+    // broadcast context. Log the exit, because a silent stop leaves no trace.
+    BOOST_LOG(warning) << "Video broadcast thread exited, raising broadcast shutdown"sv;
 
     shutdown_event->raise(true);
   }
@@ -2243,6 +2291,11 @@ namespace stream {
       auto addr = boost::asio::ip::make_address(addr_string);
       session.video.peer.address(addr);
       session.video.peer.port(0);
+
+      session.video.shards_sent.store(0, std::memory_order_relaxed);
+      session.video.send_failures.store(0, std::memory_order_relaxed);
+      session.video.watchdog_last_failures = 0;
+      session.video.watchdog_failing_since = std::chrono::steady_clock::time_point::min();
 
       session.audio.peer.address(addr);
       session.audio.peer.port(0);

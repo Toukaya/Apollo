@@ -1363,6 +1363,14 @@ namespace video {
               std::this_thread::sleep_for(20ms);
             }
 
+            // A display that never comes back used to spin this loop about twice
+            // a second forever, and only a service restart cleared it. Back off
+            // between attempts, and run the recovery command once the display
+            // stays missing.
+            auto no_display_since = std::chrono::steady_clock::now();
+            bool recovery_attempted = false;
+            auto retry_delay = 0ms;
+
             while (capture_ctx_queue->running()) {
               // Release the display before reenumerating displays, since some capture backends
               // only support a single display session per device/application.
@@ -1382,6 +1390,34 @@ namespace video {
                 proc::proc.display_name = display_names[display_p];
                 break;
               }
+
+              auto missing_for = std::chrono::steady_clock::now() - no_display_since;
+
+              if (!recovery_attempted &&
+                  !config::video.display_recovery_cmd.empty() &&
+                  config::video.display_recovery_timeout.count() > 0 &&
+                  missing_for > config::video.display_recovery_timeout) {
+                recovery_attempted = true;
+                BOOST_LOG(warning) << "No display for "sv
+                                   << std::chrono::duration_cast<std::chrono::seconds>(missing_for).count()
+                                   << "s, running display_recovery_cmd: "sv
+                                   << config::video.display_recovery_cmd;
+
+                std::error_code ec;
+                auto env = proc::proc.get_env();
+                boost::filesystem::path working_dir = proc::find_working_directory(config::video.display_recovery_cmd, env);
+                // elevated and non-interactive: a device restart needs admin rights and no user session.
+                auto child = platf::run_command(true, false, config::video.display_recovery_cmd, working_dir, env, nullptr, ec, nullptr);
+                if (ec) {
+                  BOOST_LOG(error) << "display_recovery_cmd failed to start: "sv << ec.message();
+                } else {
+                  child.detach();
+                }
+              }
+
+              // Back off, so the retry stops hammering the display stack.
+              retry_delay = std::min(retry_delay + 250ms, std::chrono::milliseconds(5000));
+              std::this_thread::sleep_for(retry_delay);
             }
             if (!disp) {
               return;
