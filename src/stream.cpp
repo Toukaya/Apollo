@@ -26,6 +26,8 @@ extern "C" {
 #include "crypto.h"
 #include "display_device.h"
 #include "globals.h"
+#include "platform/windows/seamless_table.h"
+#include "platform/windows/window_enum.h"
 #include "input.h"
 #include "logging.h"
 #include "network.h"
@@ -446,6 +448,11 @@ namespace stream {
     safe::signal_t controlEnd;
 
     std::atomic<session::state_e> state;
+    // The seamless window table this session publishes. Present only while the
+    // session asked for the channel; the state machine is a pure function of the
+    // window set, so this is all the session has to remember.
+    platf::seamless::table_state seamless_table;
+    std::int64_t seamless_last_poll_ms = 0;
   };
 
   /**
@@ -742,6 +749,16 @@ namespace stream {
             return;
           }
           BOOST_LOG(verbose) << "Seamless: ack seq="sv << (int) bytes[1] << " result="sv << (int) bytes[2];
+          // The table advances only on the client's word. A rejected version
+          // clears the published set, so the next one is a snapshot.
+          {
+            std::vector<platf::seamless::window_rec> current;
+            platf::seamless::snapshot(current);
+            if (current.size() > SEAMLESS_MAX_WINDOWS) {
+              current.resize(SEAMLESS_MAX_WINDOWS);
+            }
+            platf::seamless::apply_ack(session->seamless_table, bytes[1], bytes[2], current);
+          }
           break;
         }
 
@@ -771,6 +788,69 @@ namespace stream {
           break;
       }
     }
+  }  // namespace seamless
+
+  namespace seamless {
+    /**
+     * @brief Publish one table version when the window set says so.
+     * @details Called from the control loop, at most once per poll interval.
+     *          Reads the window set, plans the version and sends it; the ack
+     *          handler advances the sequence. Nothing here changes a window.
+     */
+    void publish_tick(session_t *session, std::int64_t now_ms) {
+      if (!session->config.seamless_enabled) {
+        return;
+      }
+      if (now_ms - session->seamless_last_poll_ms < platf::seamless::POLL_INTERVAL_MS) {
+        return;
+      }
+      session->seamless_last_poll_ms = now_ms;
+
+      std::vector<platf::seamless::window_rec> windows;
+      if (!platf::seamless::snapshot(windows)) {
+        BOOST_LOG(warning) << "Seamless: window enumeration failed"sv;
+        return;
+      }
+      if (windows.size() > SEAMLESS_MAX_WINDOWS) {
+        windows.resize(SEAMLESS_MAX_WINDOWS);
+      }
+
+      int kind = 0;
+      std::uint8_t seq = 0;
+      std::uint8_t mask = 0;
+      std::vector<LiSeamlessWindowEntry> entries;
+      if (!platf::seamless::plan_publish(session->seamless_table, windows, now_ms,
+                                        kind, seq, mask, entries)) {
+        return;
+      }
+
+      const auto area = platf::seamless::virtual_work_area();
+      int sent = 0;
+      if (kind == 1) {
+        sent = LiSendWindowSnapshot(seq, static_cast<std::uint16_t>(0), static_cast<std::uint16_t>(0),
+                                    area.x, area.y, area.w, area.h,
+                                    entries.data(), static_cast<int>(entries.size()));
+        BOOST_LOG(verbose) << "Seamless: snapshot seq="sv << (int) seq << " entries="sv << entries.size();
+      }
+      else {
+        sent = LiSendWindowDelta(seq, mask, area.x, area.y, area.w, area.h,
+                                 entries.data(), static_cast<int>(entries.size()));
+        BOOST_LOG(verbose) << "Seamless: delta seq="sv << (int) seq << " entries="sv << entries.size()
+                           << " mask=0x"sv << util::hex(mask).to_string_view();
+      }
+
+      if (sent != 0) {
+        // The transport refused it: the client never saw this version, so the
+        // sequence must not advance and the same version is retried.
+        session->seamless_table.pending = false;
+        session->seamless_table.sent_once = false;
+        BOOST_LOG(warning) << "Seamless: table send failed: "sv << sent;
+      }
+    }
+  }  // namespace seamless
+
+  namespace seamless {
+    void publish_tick(session_t *session, std::int64_t now_ms);
   }  // namespace seamless
 
   void control_server_t::call(std::uint16_t type, session_t *session, const std::string_view &payload, bool reinjected) {
@@ -1368,6 +1448,13 @@ namespace stream {
           }
 
           auto session = *pos;
+
+          // Publish the window table when the poll says something changed. The
+          // tick is rate limited, reads the window set and sends nothing when
+          // the set is unchanged, so idle traffic stays at zero.
+          seamless::publish_tick(session, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            now.time_since_epoch())
+                                            .count());
 
           if (now > session->pingTimeout) {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
