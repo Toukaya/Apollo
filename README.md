@@ -21,6 +21,10 @@ The fork adds the following on top of upstream Apollo:
 - `CMakeLists.txt` `project(Apollo VERSION ...)` set to **0.4.7** (claiming the version that upstream skipped between v0.4.7-alpha.1 and v0.4.8); annotated git tag `v0.4.7` exists.
 - `src/main.cpp` emits an extra startup banner line: `[Toukaya PCM-mic fork] mic ingest = raw PCM via SDP a=fmtp:97 x-ml-mic.* (Opus mic path removed)` so a running binary is unambiguously identifiable.
 
+### Shared protocol pointer, stage 0
+
+The shared protocol submodule is now at `f69925b`, the same SHA the client records, so host and client build against one control-channel layout. The nested transport submodule moved from `c7353c0` to `aca8784`; its only header change is a build guard for a non-Windows console target, so the public host struct layout is unchanged and that move alone does not require a clean rebuild. Stage 0 of the seamless-window work is this pointer move plus a green host build; no seamless message is enabled yet.
+
 ### Build discipline: clean rebuild required across enet bumps
 
 The bundled `moonlight-common-c/enet` sub-submodule tracks upstream (currently `c7353c0`). Note: enet `78cc9b4` inserts a new `int wildcardBind` field between `socket` and `address` in the public `_ENetHost` struct, shifting the byte offset of every subsequent field. This is a **silent ABI break** — enet did not bump SONAME or document the change as binary-incompatible.
