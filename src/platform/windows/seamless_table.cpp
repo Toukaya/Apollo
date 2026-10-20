@@ -115,12 +115,18 @@ namespace platf::seamless {
 
     // A version is in flight: either wait, or re-send that same version. The
     // sequence never moves on while the client has not answered.
+    bool resend = false;
     if (state.pending) {
       if (now_ms < state.deadline_ms) {
         return false;
       }
       state.pending = false;
       state.published.clear();
+      // The version timed out unacknowledged, so the same version goes out
+      // again. This must not fall through to the identical-set test: with an
+      // empty window set that test sees 0 against 0 and decides there is
+      // nothing to publish, which would leave the host waiting forever.
+      resend = true;
     }
 
     std::uint8_t mask = 0;
@@ -145,7 +151,7 @@ namespace platf::seamless {
     }
     else {
       // Nothing to say when the set is identical to what was acknowledged.
-      if (state.sent_once && state.published.size() == cur.size()) {
+      if (!resend && state.sent_once && state.published.size() == cur.size()) {
         bool identical = true;
         for (const auto &rec : cur) {
           const auto *before = find_by_id(state.published, rec.id);
