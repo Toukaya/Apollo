@@ -61,34 +61,21 @@ namespace platf::seamless {
     return canvas;
   }
 
-  bool to_entry(const window_rec &rec, const canvas_rect &canvas, const work_area_t &area,
-                LiSeamlessWindowEntry &out) {
+  bool to_entry(const window_rec &rec, const canvas_rect &canvas, LiSeamlessWindowEntry &out) {
     out = LiSeamlessWindowEntry {};
 
-    // The cell is the window rectangle clipped to the work area, which is where
-    // a window can actually be drawn. Clipping is what keeps every cell inside
-    // the canvas when a window hangs over an edge of the desktop.
-    const std::int32_t left = std::max<std::int32_t>(rec.x, area.x);
-    const std::int32_t top = std::max<std::int32_t>(rec.y, area.y);
-    const std::int32_t right = std::min<std::int32_t>(static_cast<std::int32_t>(rec.x) + rec.w,
-                                                      static_cast<std::int32_t>(area.x) + area.w);
-    const std::int32_t bottom = std::min<std::int32_t>(static_cast<std::int32_t>(rec.y) + rec.h,
-                                                       static_cast<std::int32_t>(area.y) + area.h);
-    if (right <= left || bottom <= top) {
+    if (rec.w == 0 || rec.h == 0 || rec.w > canvas.w || rec.h > canvas.h) {
       return false;
     }
 
-    // A cell is measured from the canvas corner, which is what makes it a
-    // positive offset even when the desktop origin is negative.
-    const std::int32_t cell_x = left - canvas.x;
-    const std::int32_t cell_y = top - canvas.y;
-    const std::int32_t cell_w = right - left;
-    const std::int32_t cell_h = bottom - top;
-
-    if (cell_x < 0 || cell_y < 0 || cell_w <= 0 || cell_h <= 0 ||
-        cell_x + cell_w > canvas.w || cell_y + cell_h > canvas.h) {
-      return false;
-    }
+    // The cell is the whole window, never a crop of it: the client draws the
+    // cell the host filled, so a cropped cell would be drawn stretched. A window
+    // that hangs over an edge keeps its whole rectangle and the cell moves by the
+    // overhang to stay inside the canvas; packing owns the layout from stage 4.
+    std::int32_t cell_x = static_cast<std::int32_t>(rec.x) - canvas.x;
+    std::int32_t cell_y = static_cast<std::int32_t>(rec.y) - canvas.y;
+    cell_x = std::clamp<std::int32_t>(cell_x, 0, static_cast<std::int32_t>(canvas.w) - rec.w);
+    cell_y = std::clamp<std::int32_t>(cell_y, 0, static_cast<std::int32_t>(canvas.h) - rec.h);
 
     out.id = rec.id;
     out.desktopX = rec.x;
@@ -98,8 +85,8 @@ namespace platf::seamless {
     out.titleHash = rec.title_hash;
     out.cellX = static_cast<std::uint16_t>(cell_x);
     out.cellY = static_cast<std::uint16_t>(cell_y);
-    out.cellW = static_cast<std::uint16_t>(cell_w);
-    out.cellH = static_cast<std::uint16_t>(cell_h);
+    out.cellW = rec.w;
+    out.cellH = rec.h;
     out.clientW = rec.w;
     out.clientH = rec.h;
     return true;
@@ -147,7 +134,7 @@ namespace platf::seamless {
   }
 
   bool plan_publish(table_state &state, const std::vector<window_rec> &cur, std::int64_t now_ms,
-                    const canvas_rect &canvas, const work_area_t &area,
+                    const canvas_rect &canvas,
                     int &out_kind, std::uint8_t &out_seq, std::uint8_t &out_mask,
                     std::vector<LiSeamlessWindowEntry> &out_entries) {
     out_kind = 0;
@@ -156,14 +143,14 @@ namespace platf::seamless {
     out_entries.clear();
 
     // The table describes the windows that keep a cell on the canvas. A window
-    // outside it has nothing to draw, so it is not part of the set the client
-    // is told about, and its arrival or departure is not a membership change
-    // the client could apply.
+    // that does not fit has nothing the client could draw, so it is not part of
+    // the set the client is told about, and its arrival or departure is not a
+    // membership change the client could apply.
     std::vector<window_rec> shown;
     shown.reserve(cur.size());
     for (const auto &rec : cur) {
       LiSeamlessWindowEntry entry {};
-      if (to_entry(rec, canvas, area, entry)) {
+      if (to_entry(rec, canvas, entry)) {
         shown.push_back(rec);
       }
     }
@@ -185,10 +172,17 @@ namespace platf::seamless {
       resend = true;
     }
 
+    // A delta carries no canvas, so a version whose canvas differs from the last
+    // sent one has to be a snapshot: the client would read its cells against the
+    // canvas it holds.
+    const bool canvas_moved = state.sent_once &&
+                              (state.canvas.x != canvas.x || state.canvas.y != canvas.y ||
+                               state.canvas.w != canvas.w || state.canvas.h != canvas.h);
+
     std::uint8_t mask = 0;
     std::vector<window_rec> changed;
 
-    bool delta = state.sent_once && !state.published.empty() &&
+    bool delta = state.sent_once && !canvas_moved && !state.published.empty() &&
                  build_delta(state.published, shown, mask, changed);
 
     if (!state.sent_once) {
@@ -203,7 +197,7 @@ namespace platf::seamless {
       out_mask = mask;
       for (const auto &rec : changed) {
         LiSeamlessWindowEntry entry {};
-        if (to_entry(rec, canvas, area, entry)) {
+        if (to_entry(rec, canvas, entry)) {
           out_entries.push_back(entry);
         }
       }
@@ -231,7 +225,7 @@ namespace platf::seamless {
       out_kind = 1;
       for (const auto &rec : shown) {
         LiSeamlessWindowEntry entry {};
-        if (to_entry(rec, canvas, area, entry)) {
+        if (to_entry(rec, canvas, entry)) {
           out_entries.push_back(entry);
         }
       }
@@ -242,6 +236,7 @@ namespace platf::seamless {
     state.deadline_ms = now_ms + ACK_TIMEOUT_MS;
     state.sent_once = true;
     state.inflight = shown;
+    state.canvas = canvas;
     return true;
   }
 
@@ -252,7 +247,7 @@ namespace platf::seamless {
     out_wire.clear();
 
     std::vector<LiSeamlessWindowEntry> entries;
-    if (!plan_publish(state, cur, now_ms, canvas, area, out_kind, out_seq, out_mask, entries)) {
+    if (!plan_publish(state, cur, now_ms, canvas, out_kind, out_seq, out_mask, entries)) {
       return false;
     }
 
