@@ -17,6 +17,7 @@
 #include "display.h"
 #include "misc.h"
 #include "src/logging.h"
+#include "display_wgc_window.h"
 
 namespace platf {
   using namespace std::literals;
@@ -344,3 +345,192 @@ namespace platf::dxgi {
     return dup.release_frame();
   }
 }  // namespace platf::dxgi
+
+namespace platf::seamless {
+  struct window_capture_t::impl_t {
+    winrt::GraphicsCaptureItem item {nullptr};
+    winrt::Direct3D11CaptureFramePool frame_pool {nullptr};
+    winrt::GraphicsCaptureSession capture_session {nullptr};
+
+    // The producer (the frame pool's thread) hands the newest frame to the
+    // consumer (the capture thread) under this lock, exactly as the monitor
+    // capture does.
+    SRWLOCK frame_lock {SRWLOCK_INIT};
+    CONDITION_VARIABLE frame_present_cv {CONDITION_VARIABLE_INIT};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame produced_frame {nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame consumed_frame {nullptr};
+    bool running = false;
+
+    ~impl_t() {
+      close();
+    }
+
+    void close() {
+      running = false;
+      if (capture_session) {
+        capture_session.Close();
+        capture_session = nullptr;
+      }
+      if (frame_pool) {
+        frame_pool.Close();
+        frame_pool = nullptr;
+      }
+      item = nullptr;
+      if (consumed_frame) {
+        consumed_frame.Close();
+        consumed_frame = nullptr;
+      }
+      if (produced_frame) {
+        produced_frame.Close();
+        produced_frame = nullptr;
+      }
+    }
+
+    void on_frame_arrived(winrt::Direct3D11CaptureFramePool const &sender, winrt::IInspectable const &) {
+      winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame {nullptr};
+      try {
+        frame = sender.TryGetNextFrame();
+      }
+      catch (winrt::hresult_error &e) {
+        BOOST_LOG(warning) << "Seamless: window frame capture failed: 0x"sv << util::hex(e.code()).to_string_view();
+        return;
+      }
+      if (frame == nullptr) {
+        return;
+      }
+
+      AcquireSRWLockExclusive(&frame_lock);
+      if (produced_frame) {
+        produced_frame.Close();
+      }
+      produced_frame = frame;
+      ReleaseSRWLockExclusive(&frame_lock);
+      WakeConditionVariable(&frame_present_cv);
+    }
+  };
+
+  window_capture_t::window_capture_t() : _impl(std::make_unique<impl_t>()) {}
+
+  window_capture_t::~window_capture_t() = default;
+
+  int window_capture_t::init(HWND hwnd, ID3D11Device *device, std::uint32_t framerate) {
+    if (hwnd == nullptr || device == nullptr) {
+      return -1;
+    }
+
+    try {
+      if (!winrt::GraphicsCaptureSession::IsSupported()) {
+        BOOST_LOG(warning) << "Seamless: this system cannot capture a window"sv;
+        return -1;
+      }
+
+      // The frame pool must hand out textures from the same device as the canvas,
+      // or the cell copy becomes a cross device transfer.
+      winrt::com_ptr<::IDXGIDevice> dxgi;
+      if (FAILED(device->QueryInterface(IID_IDXGIDevice, dxgi.put_void()))) {
+        BOOST_LOG(warning) << "Seamless: the canvas device has no DXGI device"sv;
+        return -1;
+      }
+      winrt::com_ptr<::IInspectable> d3d_comhandle;
+      if (FAILED(winrt::CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), d3d_comhandle.put()))) {
+        BOOST_LOG(warning) << "Seamless: no WinRT device for the canvas device"sv;
+        return -1;
+      }
+      auto uwp_device = d3d_comhandle.as<winrt::IDirect3DDevice>();
+
+      auto interop = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+      if (interop == nullptr ||
+          FAILED(interop->CreateForWindow(hwnd, winrt::guid_of<winrt::IGraphicsCaptureItem>(),
+                                          winrt::put_abi(_impl->item)))) {
+        BOOST_LOG(info) << "Seamless: window "sv << (std::uint32_t) (std::uintptr_t) hwnd
+                        << " cannot be captured, it leaves the table"sv;
+        return -1;
+      }
+
+      _impl->frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        uwp_device, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2,
+        _impl->item.Size());
+      _impl->capture_session = _impl->frame_pool.CreateCaptureSession(_impl->item);
+      _impl->frame_pool.FrameArrived({_impl.get(), &impl_t::on_frame_arrived});
+
+      // The window is drawn by the client, so its own pointer does not travel.
+      _impl->capture_session.IsCursorCaptureEnabled(false);
+
+      try {
+        if (winrt::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
+          _impl->capture_session.IsBorderRequired(false);
+        }
+      }
+      catch (winrt::hresult_error &e) {
+        BOOST_LOG(warning) << "Seamless: cannot disable the capture border: 0x"sv << util::hex(e.code()).to_string_view();
+      }
+
+      try {
+        if (framerate > 0 && winrt::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
+          _impl->capture_session.MinUpdateInterval(winrt::TimeSpan {10000000 / (framerate * 2)});
+        }
+      }
+      catch (winrt::hresult_error &e) {
+        BOOST_LOG(warning) << "Seamless: cannot bound the window update interval: 0x"sv << util::hex(e.code()).to_string_view();
+      }
+
+      _impl->capture_session.StartCapture();
+      _impl->running = true;
+      return 0;
+    }
+    catch (winrt::hresult_error &e) {
+      BOOST_LOG(warning) << "Seamless: window capture failed: 0x"sv << util::hex(e.code()).to_string_view();
+      _impl->close();
+      return -1;
+    }
+  }
+
+  bool window_capture_t::valid() const {
+    return _impl->running && _impl->capture_session != nullptr;
+  }
+
+  capture_e window_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out,
+                                         std::uint64_t &out_time) {
+    if (!valid()) {
+      return capture_e::error;
+    }
+
+    release_frame();
+
+    AcquireSRWLockExclusive(&_impl->frame_lock);
+    if (_impl->produced_frame == nullptr &&
+        SleepConditionVariableSRW(&_impl->frame_present_cv, &_impl->frame_lock, (DWORD) timeout.count(), 0) == 0) {
+      ReleaseSRWLockExclusive(&_impl->frame_lock);
+      return GetLastError() == ERROR_TIMEOUT ? capture_e::timeout : capture_e::error;
+    }
+    if (_impl->produced_frame) {
+      _impl->consumed_frame = _impl->produced_frame;
+      _impl->produced_frame = nullptr;
+    }
+    ReleaseSRWLockExclusive(&_impl->frame_lock);
+
+    if (_impl->consumed_frame == nullptr) {
+      return capture_e::timeout;
+    }
+
+    auto access = _impl->consumed_frame.Surface().as<winrt::IDirect3DDxgiInterfaceAccess>();
+    if (access == nullptr || FAILED(access->GetInterface(IID_ID3D11Texture2D, (void **) out)) || *out == nullptr) {
+      return capture_e::error;
+    }
+
+    out_time = _impl->consumed_frame.SystemRelativeTime().count();
+    return capture_e::ok;
+  }
+
+  capture_e window_capture_t::release_frame() {
+    if (_impl->consumed_frame) {
+      _impl->consumed_frame.Close();
+      _impl->consumed_frame = nullptr;
+    }
+    return capture_e::ok;
+  }
+
+  void window_capture_t::close() {
+    _impl->close();
+  }
+}  // namespace platf::seamless
