@@ -29,6 +29,7 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include <moonlight-common-c/src/SeamlessStream.h>
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
@@ -989,6 +990,13 @@ namespace nvhttp {
       }
     }
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
+
+    // The host describes the window channel it can carry. A client still has to
+    // offer the capability in its own description before the channel opens.
+    tree.put("root.seamless", 1);
+    tree.put("root.seamlessCanvasMaxW", SEAMLESS_MAX_CANVAS);
+    tree.put("root.seamlessCanvasMaxH", SEAMLESS_MAX_CANVAS);
+    tree.put("root.seamlessMaxWindows", SEAMLESS_MAX_WINDOWS);
 
     if (!config::nvhttp.external_ip.empty()) {
       tree.put("root.ExternalIP", config::nvhttp.external_ip);

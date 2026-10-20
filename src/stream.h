@@ -30,6 +30,10 @@ namespace stream {
     int packetsize;
     int minRequiredFecPackets;
     int mlFeatureFlags;
+
+    // Set from the client feature flags. The seamless window channel stays
+    // closed for every session that did not ask for it.
+    bool seamless_enabled = false;
     int controlProtocolType;
     int audioQosType;
     int videoQosType;

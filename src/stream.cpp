@@ -16,6 +16,7 @@
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
+#include <moonlight-common-c/src/SeamlessStream.h>
 #include "rswrapper.h"
   // clang-format on
 }
@@ -576,10 +577,214 @@ namespace stream {
    * @param payload The payload of the message.
    * @param reinjected `true` if this message is being reprocessed after decryption.
    */
+  namespace seamless {
+    namespace {
+      constexpr std::uint32_t crc32(const std::uint8_t *data, std::size_t length) {
+        std::uint32_t crc = 0xFFFFFFFFu;
+        for (std::size_t i = 0; i < length; ++i) {
+          crc ^= data[i];
+          for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+          }
+        }
+        return crc ^ 0xFFFFFFFFu;
+      }
+
+      inline std::uint16_t rd16(const std::uint8_t *p) {
+        return (std::uint16_t) (p[0] | ((std::uint16_t) p[1] << 8));
+      }
+
+      inline std::uint32_t rd32(const std::uint8_t *p) {
+        return (std::uint32_t) p[0] | ((std::uint32_t) p[1] << 8) |
+               ((std::uint32_t) p[2] << 16) | ((std::uint32_t) p[3] << 24);
+      }
+
+      inline std::int16_t rdi16(const std::uint8_t *p) {
+        return (std::int16_t) rd16(p);
+      }
+    }  // namespace
+
+    /**
+     * @brief Parse and log one message of the seamless window channel.
+     * @details This stage parses and logs only. Every message is length checked
+     *          against its documented fixed size, and the table messages are
+     *          checked against the documented limits and their checksum, before
+     *          any field of them is used. A message that fails a check is
+     *          dropped without touching the session.
+     */
+    void receive(session_t *session, const std::string_view &payload) {
+      if (!session->config.seamless_enabled) {
+        BOOST_LOG(verbose) << "Seamless: message dropped, the session did not negotiate the channel"sv;
+        return;
+      }
+      if (payload.size() < 1) {
+        BOOST_LOG(warning) << "Seamless: empty message dropped"sv;
+        return;
+      }
+
+      const auto *bytes = reinterpret_cast<const std::uint8_t *>(payload.data());
+      const auto length = (int) payload.size();
+      const auto type = bytes[0];
+
+      switch (type) {
+        case SEAMLESS_MSG_WINDOW_SNAPSHOT:
+        case SEAMLESS_MSG_WINDOW_DELTA: {
+          const bool snapshot = type == SEAMLESS_MSG_WINDOW_SNAPSHOT;
+          const int header = snapshot ? SEAMLESS_SNAPSHOT_HEADER_SIZE : SEAMLESS_DELTA_HEADER_SIZE;
+          if (length < header) {
+            BOOST_LOG(warning) << "Seamless: table message of "sv << length << " bytes dropped, header is "sv << header;
+            return;
+          }
+          const auto seq = bytes[1];
+          const auto count = snapshot ? bytes[2] : bytes[3];
+          const auto mask = snapshot ? 0 : bytes[2];
+          if (count > SEAMLESS_MAX_WINDOWS) {
+            BOOST_LOG(warning) << "Seamless: table message with "sv << (int) count
+                               << " entries dropped, maximum is "sv << SEAMLESS_MAX_WINDOWS;
+            return;
+          }
+          if (length != header + (int) count * SEAMLESS_ENTRY_SIZE) {
+            BOOST_LOG(warning) << "Seamless: table message of "sv << length << " bytes dropped, expected "
+                               << (header + (int) count * SEAMLESS_ENTRY_SIZE);
+            return;
+          }
+          if (snapshot) {
+            const auto canvasW = rd16(bytes + 3);
+            const auto canvasH = rd16(bytes + 5);
+            if (canvasW > SEAMLESS_MAX_CANVAS || canvasH > SEAMLESS_MAX_CANVAS) {
+              BOOST_LOG(warning) << "Seamless: canvas "sv << canvasW << 'x' << canvasH
+                                 << " over the maximum dropped"sv;
+              return;
+            }
+            if (crc32(bytes + header, (std::size_t) count * SEAMLESS_ENTRY_SIZE) != rd32(bytes + 7)) {
+              BOOST_LOG(warning) << "Seamless: table checksum mismatch dropped"sv;
+              return;
+            }
+            for (int i = 0; i < count; ++i) {
+              const auto *e = bytes + header + i * SEAMLESS_ENTRY_SIZE;
+              const auto cellX = rd16(e + 4), cellY = rd16(e + 6);
+              const auto cellW = rd16(e + 8), cellH = rd16(e + 10);
+              const auto clientW = rd16(e + 12), clientH = rd16(e + 14);
+              if (!cellW || !cellH || !clientW || !clientH ||
+                  cellX + (int) cellW > canvasW || cellY + (int) cellH > canvasH) {
+                BOOST_LOG(warning) << "Seamless: entry "sv << i << " out of bounds dropped"sv;
+                return;
+              }
+            }
+          }
+          BOOST_LOG(verbose) << "Seamless: "sv << (snapshot ? "snapshot"sv : "delta"sv)
+                             << " seq="sv << (int) seq << " count="sv << (int) count
+                             << " mask=0x"sv << util::hex(mask).to_string_view()
+                             << " workarea="sv << rdi16(bytes + (snapshot ? 11 : 4)) << ','
+                             << rdi16(bytes + (snapshot ? 13 : 6)) << ' '
+                             << rd16(bytes + (snapshot ? 15 : 8)) << 'x'
+                             << rd16(bytes + (snapshot ? 17 : 10));
+          break;
+        }
+
+        case SEAMLESS_MSG_ICON: {
+          if (length < SEAMLESS_ICON_HEADER_SIZE) {
+            BOOST_LOG(warning) << "Seamless: icon message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          const auto iconHash = rd32(bytes + 1);
+          const auto iconLength = rd16(bytes + 5);
+          if (!iconLength || iconLength > SEAMLESS_MAX_ICON ||
+              length != SEAMLESS_ICON_HEADER_SIZE + (int) iconLength) {
+            BOOST_LOG(warning) << "Seamless: icon length "sv << iconLength << " dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: icon hash=0x"sv << util::hex(iconHash).to_string_view()
+                             << " length="sv << iconLength;
+          break;
+        }
+
+        case SEAMLESS_MSG_CARET_POSITION: {
+          if (length != SEAMLESS_CARET_SIZE) {
+            BOOST_LOG(warning) << "Seamless: caret message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: caret window="sv << (int) bytes[1]
+                             << " at "sv << rdi16(bytes + 2) << ',' << rdi16(bytes + 4)
+                             << " height="sv << rd16(bytes + 6);
+          break;
+        }
+
+        case SEAMLESS_MSG_WINDOW_INTENT: {
+          if (length != SEAMLESS_INTENT_SIZE) {
+            BOOST_LOG(warning) << "Seamless: intent message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          if (bytes[2] > SEAMLESS_INTENT_STICKY) {
+            BOOST_LOG(warning) << "Seamless: intent kind "sv << (int) bytes[2] << " dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: intent window="sv << (int) bytes[1]
+                             << " kind="sv << (int) bytes[2]
+                             << " rect="sv << rdi16(bytes + 3) << ',' << rdi16(bytes + 5) << ' '
+                             << rd16(bytes + 7) << 'x' << rd16(bytes + 9);
+          break;
+        }
+
+        case SEAMLESS_MSG_WINDOW_INPUT: {
+          if (length != SEAMLESS_INPUT_SIZE) {
+            BOOST_LOG(warning) << "Seamless: input message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: input window="sv << (int) bytes[1]
+                             << " mode="sv << (int) bytes[2] << " pid="sv << rd32(bytes + 3);
+          break;
+        }
+
+        case SEAMLESS_MSG_WINDOW_ACK: {
+          if (length != SEAMLESS_ACK_SIZE) {
+            BOOST_LOG(warning) << "Seamless: ack message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: ack seq="sv << (int) bytes[1] << " result="sv << (int) bytes[2];
+          break;
+        }
+
+        case SEAMLESS_MSG_PRESENT: {
+          if (length != SEAMLESS_PRESENT_SIZE) {
+            BOOST_LOG(warning) << "Seamless: present message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: present frame="sv << rd32(bytes + 1)
+                             << " at "sv << rd32(bytes + 5) << " us"sv;
+          break;
+        }
+
+        case SEAMLESS_MSG_SKIP: {
+          if (length != SEAMLESS_SKIP_SIZE) {
+            BOOST_LOG(warning) << "Seamless: skip message of "sv << length << " bytes dropped"sv;
+            return;
+          }
+          BOOST_LOG(verbose) << "Seamless: skip frame="sv << rd32(bytes + 1)
+                             << " reason="sv << (int) bytes[5];
+          break;
+        }
+
+        default:
+          BOOST_LOG(warning) << "Seamless: unknown message type 0x"sv
+                             << util::hex(type).to_string_view();
+          break;
+      }
+    }
+  }  // namespace seamless
+
   void control_server_t::call(std::uint16_t type, session_t *session, const std::string_view &payload, bool reinjected) {
     // If we are using the encrypted control stream protocol, drop any messages that come off the wire unencrypted
     if (session->config.controlProtocolType == 13 && !reinjected && type != packetTypes[IDX_ENCRYPTED]) {
       BOOST_LOG(error) << "Dropping unencrypted message on encrypted control stream: "sv << util::hex(type).to_string_view();
+      return;
+    }
+
+    // The seamless window messages carry their own message set. The carrier
+    // type selects this parser, both for a clear payload and for one that came
+    // back from the decryption step.
+    if (type == SEAMLESS_PACKET_TYPE) {
+      seamless::receive(session, payload);
       return;
     }
 
