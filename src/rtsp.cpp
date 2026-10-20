@@ -1053,6 +1053,12 @@ namespace rtsp_stream {
       config.mlFeatureFlags = util::from_view(args.at("x-ml-general.featureFlags"sv));
       config.seamless_enabled = seamless::session_enabled(config.mlFeatureFlags);
       if (config.seamless_enabled) {
+        // The shared protocol layer holds one flag for the channel. It is off
+        // until a session negotiates, so the shared send path cannot be used by
+        // a session that never answered the capability. The session gate above
+        // stays the per-session authority; this flag only tells the layer that
+        // this host carries the channel at all.
+        LiSetSeamlessEnabled(1);
         BOOST_LOG(info) << "Seamless: the client asked for the window channel"sv;
       }
       config.audioQosType = util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));

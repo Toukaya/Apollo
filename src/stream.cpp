@@ -26,6 +26,8 @@ extern "C" {
 #include "crypto.h"
 #include "display_device.h"
 #include "globals.h"
+#include "platform/windows/seamless_table.h"
+#include "platform/windows/window_enum.h"
 #include "input.h"
 #include "logging.h"
 #include "network.h"
@@ -446,6 +448,11 @@ namespace stream {
     safe::signal_t controlEnd;
 
     std::atomic<session::state_e> state;
+    // The seamless window table this session publishes. Present only while the
+    // session asked for the channel; the state machine is a pure function of the
+    // window set, so this is all the session has to remember.
+    platf::seamless::table_state seamless_table;
+    std::int64_t seamless_last_poll_ms = 0;
   };
 
   /**
@@ -579,6 +586,10 @@ namespace stream {
    */
   namespace seamless {
     namespace {
+      /// The largest encoded table: one snapshot header and every window entry.
+      constexpr std::size_t MAX_SEAMLESS_MESSAGE =
+        SEAMLESS_SNAPSHOT_HEADER_SIZE + SEAMLESS_MAX_WINDOWS * SEAMLESS_ENTRY_SIZE;
+
       constexpr std::uint32_t crc32(const std::uint8_t *data, std::size_t length) {
         std::uint32_t crc = 0xFFFFFFFFu;
         for (std::size_t i = 0; i < length; ++i) {
@@ -742,6 +753,11 @@ namespace stream {
             return;
           }
           BOOST_LOG(verbose) << "Seamless: ack seq="sv << (int) bytes[1] << " result="sv << (int) bytes[2];
+          // The table advances only on the client's word. The acknowledgement
+          // applies to the version that was sent, which the table state kept,
+          // so this handler never reads the window set again: a window that
+          // changed while the version was in flight must still be sent.
+          platf::seamless::apply_ack(session->seamless_table, bytes[1], bytes[2]);
           break;
         }
 
@@ -771,6 +787,92 @@ namespace stream {
           break;
       }
     }
+  }  // namespace seamless
+
+  namespace seamless {
+    /**
+     * @brief Publish one table version when the window set says so.
+     * @details Called from the control loop, at most once per poll interval.
+     *          Reads the window set, plans and encodes the version, and sends the
+     *          encoded bytes as the payload of one control message on this
+     *          session's own connection; the ack handler advances the sequence.
+     *          Nothing here changes a window.
+     */
+    void publish_tick(session_t *session, std::int64_t now_ms) {
+      if (!session->config.seamless_enabled) {
+        return;
+      }
+      if (now_ms - session->seamless_last_poll_ms < platf::seamless::POLL_INTERVAL_MS) {
+        return;
+      }
+      session->seamless_last_poll_ms = now_ms;
+
+      std::vector<platf::seamless::window_rec> windows;
+      if (!platf::seamless::snapshot(windows)) {
+        BOOST_LOG(warning) << "Seamless: window enumeration failed"sv;
+        return;
+      }
+      if (windows.size() > SEAMLESS_MAX_WINDOWS) {
+        windows.resize(SEAMLESS_MAX_WINDOWS);
+      }
+
+      // The canvas is the desktop rectangle and a cell is clipped to the work
+      // area: both are measured here, once, so the entries and the header of the
+      // same version cannot disagree about the geometry they describe.
+      const auto canvas = platf::seamless::virtual_canvas();
+      const auto area = platf::seamless::virtual_work_area();
+
+      int kind = 0;
+      std::uint8_t seq = 0;
+      std::uint8_t mask = 0;
+      std::vector<std::uint8_t> wire;
+      if (!platf::seamless::encode_publish(session->seamless_table, windows, now_ms, canvas, area,
+                                          kind, seq, mask, wire)) {
+        return;
+      }
+
+      // The version travels as the payload of one control message on the
+      // session's own connection. The carrier type in front of it is what
+      // selects the seamless parser on the client, and it is the same type the
+      // client puts on the messages it sends us. The shared send path is not
+      // used: a host owns one connection per session, not one shared one. The
+      // refusal in seamless_shim.cpp stays as the guard that keeps it that way.
+      std::array<std::uint8_t, sizeof(control_header_v2) + MAX_SEAMLESS_MESSAGE> plaintext {};
+      auto *header = reinterpret_cast<control_header_v2 *>(plaintext.data());
+      header->type = SEAMLESS_PACKET_TYPE;
+      header->payloadLength = static_cast<std::uint16_t>(wire.size());
+      std::copy(wire.begin(), wire.end(), plaintext.begin() + sizeof(control_header_v2));
+
+      std::array<std::uint8_t,
+        sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + MAX_SEAMLESS_MESSAGE) + crypto::cipher::tag_size>
+        tagged_cipher;
+      const std::string_view body {reinterpret_cast<const char *>(plaintext.data()),
+                                   sizeof(control_header_v2) + wire.size()};
+      const auto payload = encode_control(session, body, tagged_cipher);
+
+      int sent = -1;
+      if (!payload.empty() && session->control.peer) {
+        sent = session->broadcast_ref->control_server.send(payload, session->control.peer);
+      }
+
+      if (sent != 0) {
+        // The transport refused it: the client never saw this version, so the
+        // sequence must not advance and the same set is planned again.
+        session->seamless_table.pending = false;
+        session->seamless_table.sent_once = false;
+        session->seamless_table.inflight.clear();
+        BOOST_LOG(warning) << "Seamless: table send failed: "sv << sent;
+        return;
+      }
+
+      BOOST_LOG(verbose) << "Seamless: "sv << (kind == 1 ? "snapshot"sv : "delta"sv)
+                         << " seq="sv << (int) seq << " mask=0x"sv
+                         << util::hex(mask).to_string_view() << " bytes="sv << wire.size();
+    }
+  }  // namespace seamless
+
+  namespace seamless {
+    void publish_tick(session_t *session, std::int64_t now_ms);
   }  // namespace seamless
 
   void control_server_t::call(std::uint16_t type, session_t *session, const std::string_view &payload, bool reinjected) {
@@ -1368,6 +1470,13 @@ namespace stream {
           }
 
           auto session = *pos;
+
+          // Publish the window table when the poll says something changed. The
+          // tick is rate limited, reads the window set and sends nothing when
+          // the set is unchanged, so idle traffic stays at zero.
+          seamless::publish_tick(session, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            now.time_since_epoch())
+                                            .count());
 
           if (now > session->pingTimeout) {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
