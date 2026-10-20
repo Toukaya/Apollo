@@ -28,6 +28,8 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "rtsp.h"
+#include "seamless_gate.h"
+#include <moonlight-common-c/src/SeamlessStream.h>
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
@@ -893,6 +895,12 @@ namespace rtsp_stream {
       ss << std::endl;
     }
 
+    // The seamless window channel is a host capability, answered the same way
+    // the encryption flags are. It does not depend on the request description,
+    // which does not carry the client feature flags: those arrive with the
+    // announce request, and the per-session gate is applied there.
+    ss << seamless::capability_attributes();
+
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, ss.str());
   }
 
@@ -1043,6 +1051,10 @@ namespace rtsp_stream {
       config.packetsize = util::from_view(args.at("x-nv-video[0].packetSize"sv));
       config.minRequiredFecPackets = util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       config.mlFeatureFlags = util::from_view(args.at("x-ml-general.featureFlags"sv));
+      config.seamless_enabled = seamless::session_enabled(config.mlFeatureFlags);
+      if (config.seamless_enabled) {
+        BOOST_LOG(info) << "Seamless: the client asked for the window channel"sv;
+      }
       config.audioQosType = util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
       config.encryptionFlagsEnabled = util::from_view(args.at("x-ss-general.encryptionEnabled"sv));

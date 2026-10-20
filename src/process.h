@@ -149,6 +149,14 @@ namespace proc {
     std::shared_ptr<rtsp_stream::launch_session_t> _launch_session;
     std::shared_ptr<config::input_t> _saved_input_config;
 
+#ifdef _WIN32
+    // Tracks the most recently created virtual display GUID so that terminate()
+    // can attempt cleanup even when _launch_session has already been cleared
+    // (e.g. by an abnormal client disconnect). Zeroed after a successful
+    // fallback removal.
+    GUID _last_created_display_guid {};
+#endif
+
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;

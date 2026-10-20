@@ -496,6 +496,8 @@ namespace config {
     {},  // encoder
     {},  // adapter_name
     {},  // output_name
+    {},  // display_recovery_cmd
+    15s,  // display_recovery_timeout
 
     {
       video_t::dd_t::config_option_e::disabled,  // configuration_option
@@ -532,6 +534,7 @@ namespace config {
 
   stream_t stream {
     10s,  // ping_timeout
+    5s,  // video_stall_timeout
 
     APPS_JSON_PATH,
 
@@ -1193,6 +1196,14 @@ namespace config {
     string_f(vars, "encoder", video.encoder);
     string_f(vars, "adapter_name", video.adapter_name);
     string_f(vars, "output_name", video.output_name);
+    string_f(vars, "display_recovery_cmd", video.display_recovery_cmd);
+
+    // A separate name, because the shared 'to' is declared further down.
+    int display_recovery_to = -1;
+    int_between_f(vars, "display_recovery_timeout", display_recovery_to, {-1, std::numeric_limits<int>::max()});
+    if (display_recovery_to != -1) {
+      video.display_recovery_timeout = std::chrono::milliseconds(display_recovery_to);
+    }
 
     generic_f(vars, "dd_configuration_option", video.dd.configuration_option, dd::config_option_from_view);
     generic_f(vars, "dd_resolution_option", video.dd.resolution_option, dd::resolution_option_from_view);
@@ -1253,6 +1264,12 @@ namespace config {
     int_between_f(vars, "ping_timeout", to, {-1, std::numeric_limits<int>::max()});
     if (to != -1) {
       stream.ping_timeout = std::chrono::milliseconds(to);
+    }
+
+    to = -1;
+    int_between_f(vars, "video_stall_timeout", to, {-1, std::numeric_limits<int>::max()});
+    if (to != -1) {
+      stream.video_stall_timeout = std::chrono::milliseconds(to);
     }
 
     int_between_f(vars, "lan_encryption_mode", stream.lan_encryption_mode, {0, 2});

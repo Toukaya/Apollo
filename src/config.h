@@ -95,6 +95,17 @@ namespace config {
     std::string adapter_name;
     std::string output_name;
 
+    // Command Apollo runs when the capture loop finds no display for
+    // display_recovery_timeout. A headless host has no display of its own, so
+    // capture depends on a virtual display driver. A driver that fails leaves
+    // the capture retry loop spinning until someone restarts the service.
+    // An empty string disables the recovery attempt.
+    std::string display_recovery_cmd;
+
+    // How long the capture loop retries with no display before it runs
+    // display_recovery_cmd. Zero disables the recovery attempt.
+    std::chrono::milliseconds display_recovery_timeout;
+
     struct dd_t {
       struct workarounds_t {
         std::chrono::milliseconds hdr_toggle_delay;  ///< Specify whether to apply HDR high-contrast color workaround and what delay to use.
@@ -176,6 +187,11 @@ namespace config {
 
   struct stream_t {
     std::chrono::milliseconds ping_timeout;
+
+    // How long the video send path may keep failing before the session is stopped.
+    // A stopped session makes the client reconnect, which rebuilds the broadcast
+    // context without a service restart. Zero disables the watchdog.
+    std::chrono::milliseconds video_stall_timeout;
 
     std::string file_apps;
 

@@ -308,6 +308,11 @@ namespace proc {
         // We need to track it properly to remove the display when the session terminates.
         launch_session->virtual_display = true;
 
+        // Remember the most recently created VD GUID so terminate() can clean it
+        // up even if _launch_session has already been cleared (e.g. by an
+        // abnormal client disconnect).
+        _last_created_display_guid = launch_session->display_guid;
+
         if (!vdisplayName.empty()) {
           BOOST_LOG(info) << "Virtual Display created at " << vdisplayName;
 
@@ -771,10 +776,27 @@ namespace proc {
     if (used_virtual_display) {
       if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {
         BOOST_LOG(info) << "Virtual Display removed successfully";
+        // Mirror cleanup state: the VD we tracked is gone now.
+        if (memcmp(&_last_created_display_guid, &_launch_session->display_guid, sizeof(GUID)) == 0) {
+          _last_created_display_guid = GUID{};
+        }
       } else if (this->virtual_display) {
         BOOST_LOG(warning) << "Virtual Display remove failed";
       } else {
         BOOST_LOG(warning) << "Virtual Display remove failed, but it seems it was not created correctly either.";
+      }
+    }
+    // Belt-and-suspenders: if the session was cleared before we got here (e.g.
+    // an abnormal client disconnect cleared _launch_session) but we still have
+    // a remembered GUID from the most recent VD we created, attempt one
+    // removal so we don't leak the virtual display.
+    else if (vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK) {
+      static const GUID zero_guid {};
+      if (memcmp(&_last_created_display_guid, &zero_guid, sizeof(GUID)) != 0) {
+        if (VDISPLAY::removeVirtualDisplay(_last_created_display_guid)) {
+          BOOST_LOG(info) << "Stale virtual display removed via last-known-GUID fallback";
+          _last_created_display_guid = GUID{};
+        }
       }
     }
 

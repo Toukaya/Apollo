@@ -7,6 +7,9 @@
 
 // standard includes
 #include <stdint.h>
+// the coefficient array and the shard limits come from the codec header;
+// the function names below are rebound to the vectorized entry points.
+#include <rs.h>
 
 typedef struct _reed_solomon reed_solomon;
 
