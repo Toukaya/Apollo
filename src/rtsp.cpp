@@ -28,6 +28,7 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "rtsp.h"
+#include "seamless_gate.h"
 #include <moonlight-common-c/src/SeamlessStream.h>
 #include "stream.h"
 #include "sync.h"
@@ -777,27 +778,6 @@ namespace rtsp_stream {
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 
-  /**
-   * @brief Read the client feature flags out of the description a client sent.
-   * @return `true` when the client offered the seamless window capability.
-   */
-  bool clientOfferedSeamless(const msg_t &req) {
-    if (!req->payload || req->payloadLength <= 0) {
-      return false;
-    }
-
-    std::string_view description {req->payload, (std::size_t) req->payloadLength};
-    const std::string_view name {"x-ml-general.featureFlags:"};
-    auto pos = description.find(name);
-    if (pos == std::string_view::npos) {
-      return false;
-    }
-
-    auto value = description.substr(pos + name.size(), 16);
-    auto flags = util::from_view(value);
-    return (flags & SS_FF_SEAMLESS) != 0;
-  }
-
   void cmd_describe(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};
 
@@ -915,15 +895,11 @@ namespace rtsp_stream {
       ss << std::endl;
     }
 
-    // The seamless window channel is answered only when the client offers it in
-    // the description it sent with this request.
-    if (clientOfferedSeamless(req)) {
-      ss << "a=x-ss-general.seamless:1" << std::endl;
-      ss << "a=x-ss-general.seamless.canvasMaxW:" << SEAMLESS_MAX_CANVAS << std::endl;
-      ss << "a=x-ss-general.seamless.canvasMaxH:" << SEAMLESS_MAX_CANVAS << std::endl;
-      ss << "a=x-ss-general.seamless.maxWindows:" << SEAMLESS_MAX_WINDOWS << std::endl;
-      BOOST_LOG(info) << "Seamless: answering the capability, the client offered it"sv;
-    }
+    // The seamless window channel is a host capability, answered the same way
+    // the encryption flags are. It does not depend on the request description,
+    // which does not carry the client feature flags: those arrive with the
+    // announce request, and the per-session gate is applied there.
+    ss << seamless::capability_attributes();
 
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, ss.str());
   }
@@ -1075,7 +1051,7 @@ namespace rtsp_stream {
       config.packetsize = util::from_view(args.at("x-nv-video[0].packetSize"sv));
       config.minRequiredFecPackets = util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       config.mlFeatureFlags = util::from_view(args.at("x-ml-general.featureFlags"sv));
-      config.seamless_enabled = (config.mlFeatureFlags & SS_FF_SEAMLESS) != 0;
+      config.seamless_enabled = seamless::session_enabled(config.mlFeatureFlags);
       if (config.seamless_enabled) {
         BOOST_LOG(info) << "Seamless: the client asked for the window channel"sv;
       }
