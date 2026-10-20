@@ -33,9 +33,36 @@ namespace platf::seamless {
   /// Read the work area of the virtual desktop.
   work_area_t virtual_work_area();
 
-  /// Fill one wire entry from a window record. The canvas cell is left at zero:
-  /// packing is a later stage and this one publishes the desktop geometry.
-  LiSeamlessWindowEntry to_entry(const window_rec &rec);
+  /**
+   * @brief The virtual desktop rectangle, the canvas a published table describes.
+   * @details The origin is the virtual desktop's own top left corner, so a cell
+   *          coordinate is a positive offset inside the canvas. Packing is a
+   *          later stage: until it exists the canvas is the desktop rectangle
+   *          itself, not a rearranged one.
+   */
+  struct canvas_rect {
+    std::int16_t x = 0;
+    std::int16_t y = 0;
+    std::uint16_t w = 0;
+    std::uint16_t h = 0;
+  };
+
+  /// Read the virtual desktop rectangle of the host.
+  canvas_rect virtual_canvas();
+
+  /**
+   * @brief Fill one wire entry from a window record.
+   * @param canvas the virtual desktop rectangle a cell is measured from.
+   * @param area the work area a cell is clipped to.
+   * @param out receives the entry.
+   * @return false when the window keeps no cell inside the canvas.
+   * @details The cell of a window is its own desktop rectangle clipped to the
+   *          work area, which is the region a window can be drawn in. A window
+   *          that is entirely outside that region has nothing to draw and is
+   *          left out of the table; stage-4 packing is what gives it a cell.
+   */
+  bool to_entry(const window_rec &rec, const canvas_rect &canvas, const work_area_t &area,
+                LiSeamlessWindowEntry &out);
 
   /**
    * @brief The delta between two sets.
@@ -58,6 +85,7 @@ namespace platf::seamless {
     std::int64_t deadline_ms = 0;  ///< when to re-send the same version
     bool sent_once = false;        ///< the first publish is always a snapshot
     std::vector<window_rec> published;  ///< the set the client last acknowledged
+    std::vector<window_rec> inflight;   ///< the set sent with the version in flight
   };
 
   /**
@@ -65,6 +93,8 @@ namespace platf::seamless {
    * @param state the session state, updated in place.
    * @param cur the current window set.
    * @param now_ms a monotonic millisecond clock.
+   * @param canvas the virtual desktop rectangle the cells are measured from.
+   * @param area the work area the cells are clipped to.
    * @param out_kind receives 0 for nothing, 1 for a snapshot, 2 for a delta.
    * @param out_seq receives the sequence number of the published version.
    * @param out_mask receives the delta mask.
@@ -74,19 +104,39 @@ namespace platf::seamless {
    *          acknowledged or the acknowledgement timed out, which is what stops
    *          the client from applying a table built on an unacknowledged one. A
    *          timeout re-sends the SAME version, so a lost acknowledgement costs
-   *          one second and never a divergent table.
+   *          one second and never a divergent table. The set that goes out with
+   *          the version is kept in the state, because that set, and not a set
+   *          read later, is what the client's acknowledgement applies to.
    */
   bool plan_publish(table_state &state, const std::vector<window_rec> &cur, std::int64_t now_ms,
+                    const canvas_rect &canvas, const work_area_t &area,
                     int &out_kind, std::uint8_t &out_seq, std::uint8_t &out_mask,
                     std::vector<LiSeamlessWindowEntry> &out_entries);
 
   /**
+   * @brief Plan one version and encode it as the payload of one message.
+   * @param out_wire receives the encoded message, empty when nothing is sent.
+   * @return true when a version was encoded.
+   * @details This is the host publish path up to the transport: the same encoder
+   *          the client uses, with the same canvas and work area the entries were
+   *          measured against. A host that sends these bytes on its own session
+   *          connection sends exactly what the shared sender would have sent.
+   */
+  bool encode_publish(table_state &state, const std::vector<window_rec> &cur, std::int64_t now_ms,
+                      const canvas_rect &canvas, const work_area_t &area,
+                      int &out_kind, std::uint8_t &out_seq, std::uint8_t &out_mask,
+                      std::vector<std::uint8_t> &out_wire);
+
+  /**
    * @brief Apply an acknowledgement.
    * @return true when the acknowledgement matched the version in flight.
-   * @details A rejected or over-limit result clears the published set, so the
-   *          next version is a snapshot rather than a delta the client could not
-   *          apply on top of what it has.
+   * @details The acknowledgement applies to the set that was sent with the
+   *          version in flight, so that set becomes the diff base. A window that
+   *          changed while the version was in flight is not part of the base and
+   *          the next delta carries it; reading the set again here would absorb
+   *          the change unsent and leave a stale cell on the client. A rejected
+   *          or over-limit result clears the base, so the next version is a
+   *          snapshot rather than a delta the client could not apply.
    */
-  bool apply_ack(table_state &state, std::uint8_t seq, std::uint8_t result,
-                 const std::vector<window_rec> &cur);
+  bool apply_ack(table_state &state, std::uint8_t seq, std::uint8_t result);
 }  // namespace platf::seamless
