@@ -218,6 +218,9 @@ namespace platf::seamless {
           }
         }
         if (identical) {
+          // A canvas that moved while no window changed returns nothing here, and
+          // that keeps a matched pair: only a snapshot carries the canvas and
+          // the cells together, so until a cell moves there is nothing to repair.
           return false;
         }
       }
