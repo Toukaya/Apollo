@@ -359,6 +359,9 @@ namespace platf::seamless {
     CONDITION_VARIABLE frame_present_cv {CONDITION_VARIABLE_INIT};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame produced_frame {nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame consumed_frame {nullptr};
+    // The newest texture, kept with our own reference so a pass that changes one
+    // window can still copy the others' last content.
+    winrt::com_ptr<ID3D11Texture2D> last_frame;
     bool running = false;
 
     ~impl_t() {
@@ -518,8 +521,14 @@ namespace platf::seamless {
       return capture_e::error;
     }
 
+    _impl->last_frame.copy_from(*out);
+
     out_time = _impl->consumed_frame.SystemRelativeTime().count();
     return capture_e::ok;
+  }
+
+  ID3D11Texture2D *window_capture_t::latest_texture() const {
+    return _impl->last_frame.get();
   }
 
   capture_e window_capture_t::release_frame() {

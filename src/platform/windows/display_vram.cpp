@@ -1647,6 +1647,122 @@ namespace platf::dxgi {
    * @param cursor_visible
    */
   capture_e display_wgc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (seamless_enabled) {
+      // The canvas is composed from the windows' own surfaces. The desktop is not
+      // captured while the channel is open, and a pass with nothing new is a
+      // timeout, so the existing skip path runs and no blank frame is encoded.
+      std::vector<platf::seamless::window_rec> windows;
+      if (!platf::seamless::snapshot(windows)) {
+        return capture_e::error;
+      }
+
+      // One capture per published window; a window that left the table drops its
+      // capture and the cell it owned.
+      for (auto it = seamless_captures.begin(); it != seamless_captures.end();) {
+        bool present = false;
+        for (const auto &rec : windows) {
+          if (rec.id == it->first) {
+            present = true;
+            break;
+          }
+        }
+        if (present) {
+          ++it;
+        }
+        else {
+          it = seamless_captures.erase(it);
+        }
+      }
+
+      std::vector<std::uint32_t> dirty;
+      for (const auto &rec : windows) {
+        auto it = seamless_captures.find(rec.id);
+        if (it == seamless_captures.end()) {
+          auto capture = std::make_unique<platf::seamless::window_capture_t>();
+          if (capture->init(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(rec.id)), device.get(), seamless_framerate) != 0) {
+            continue;
+          }
+          it = seamless_captures.emplace(rec.id, std::move(capture)).first;
+        }
+
+        ID3D11Texture2D *frame = nullptr;
+        std::uint64_t frame_time = 0;
+        if (it->second->next_frame(std::chrono::milliseconds(0), &frame, frame_time) == capture_e::ok && frame != nullptr) {
+          dirty.push_back(rec.id);
+        }
+      }
+
+      auto plan = platf::seamless::plan_compose(seamless_canvas, seamless_composed, windows, dirty);
+      for (auto &pair : seamless_captures) {
+        pair.second->release_frame();
+      }
+
+      if (!plan.changed) {
+        return capture_e::timeout;
+      }
+
+      if (!seamless_canvas_texture) {
+        D3D11_TEXTURE2D_DESC desc {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &seamless_canvas_texture))) {
+          BOOST_LOG(error) << "Seamless: cannot create the canvas texture"sv;
+          return capture_e::error;
+        }
+      }
+
+      std::shared_ptr<platf::img_t> img;
+      if (!pull_free_image_cb(img)) {
+        return capture_e::interrupted;
+      }
+
+      auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+      d3d_img->blank = false;
+      if (complete_img(d3d_img.get(), false) != 0) {
+        return capture_e::error;
+      }
+
+      {
+        texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+        if (!lock_helper.lock()) {
+          BOOST_LOG(error) << "Failed to lock capture texture"sv;
+          return capture_e::error;
+        }
+
+        // Every cell is copied every pass; the plan only decided whether the
+        // pass is worth encoding.
+        std::vector<platf::seamless::canvas_copy> copies;
+        copies.reserve(plan.cells.size());
+        for (const auto &cell : plan.cells) {
+          auto capture = seamless_captures.find(cell.id);
+          if (capture == seamless_captures.end()) {
+            continue;
+          }
+          ID3D11Texture2D *source = capture->second->latest_texture();
+          if (source == nullptr) {
+            continue;
+          }
+          copies.push_back({source, cell});
+        }
+        platf::seamless::compose_cells(device_ctx.get(), seamless_canvas_texture.get(), copies);
+
+        device_ctx->CopyResource(d3d_img->capture_texture.get(), seamless_canvas_texture.get());
+      }
+
+      seamless_composed = windows;
+      img_out = img;
+      if (img_out) {
+        img_out->frame_timestamp = std::chrono::steady_clock::now();
+      }
+      return capture_e::ok;
+    }
+
     texture2d_t src;
     uint64_t frame_qpc;
     dup.set_cursor_visible(cursor_visible);
@@ -1704,6 +1820,21 @@ namespace platf::dxgi {
   }
 
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    seamless_enabled = config.seamless;
+    seamless_framerate = config.framerate;
+    seamless_canvas.x = 0;
+    seamless_canvas.y = 0;
+    seamless_canvas.w = static_cast<std::uint16_t>(width);
+    seamless_canvas.h = static_cast<std::uint16_t>(height);
+    if (seamless_enabled && capture_format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+      // The cells are copied with CopySubresourceRegion, which cannot convert a
+      // format; an HDR canvas would need a draw. Stage 3 keeps the desktop path.
+      BOOST_LOG(warning) << "Seamless: capture format 0x"sv << util::hex(capture_format).to_string_view()
+                         << " is not supported by the copy compose, the desktop path stays"sv;
+      seamless_enabled = false;
+      seamless_hdr_unsupported = true;
+    }
+
     if (display_base_t::init(config, display_name) || dup.init(this, config)) {
       return -1;
     }

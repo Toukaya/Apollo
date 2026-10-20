@@ -17,6 +17,10 @@
 #include <cstdint>
 #include <vector>
 
+// platform includes
+#include <d3d11.h>
+#include <windows.h>
+
 // local includes
 #include "seamless_table.h"
 #include "window_enum.h"
@@ -62,6 +66,21 @@ namespace platf::seamless {
    *          because stage 3 rebuilds the canvas; stage 7 makes that list the
    *          dirty subset only.
    */
+  /// One window's surface and the cell it belongs in.
+  struct canvas_copy {
+    ID3D11Texture2D *source = nullptr;
+    canvas_cell cell;
+  };
+
+  /**
+   * @brief Copy every window's own surface into its cell.
+   * @details Pure copies: the cell is the window's size (cellW == clientW), so
+   *          nothing here scales. The canvas is cleared by the caller when its
+   *          previous content must not show through.
+   */
+  void compose_cells(ID3D11DeviceContext *context, ID3D11Texture2D *canvas,
+                     const std::vector<canvas_copy> &copies);
+
   canvas_plan plan_compose(const canvas_rect &canvas,
                            const std::vector<window_rec> &previous,
                            const std::vector<window_rec> &current,

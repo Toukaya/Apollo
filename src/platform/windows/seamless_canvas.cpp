@@ -37,6 +37,23 @@ namespace platf::seamless {
     }
   }  // namespace
 
+  void compose_cells(ID3D11DeviceContext *context, ID3D11Texture2D *canvas,
+                     const std::vector<canvas_copy> &copies) {
+    if (context == nullptr || canvas == nullptr) {
+      return;
+    }
+
+    for (const auto &copy : copies) {
+      if (copy.source == nullptr || copy.cell.w == 0 || copy.cell.h == 0) {
+        continue;
+      }
+      // The whole window, never a crop: the source box is the window's size and
+      // the client samples the same rectangle.
+      const D3D11_BOX box {0, 0, 0, copy.cell.w, copy.cell.h, 1};
+      context->CopySubresourceRegion(canvas, 0, copy.cell.x, copy.cell.y, 0, copy.source, 0, &box);
+    }
+  }
+
   canvas_plan plan_compose(const canvas_rect &canvas,
                            const std::vector<window_rec> &previous,
                            const std::vector<window_rec> &current,

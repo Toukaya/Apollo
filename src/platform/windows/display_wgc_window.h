@@ -60,8 +60,12 @@ namespace platf::seamless {
     capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out,
                          std::uint64_t &out_time);
 
-    /// Release the frame next_frame() handed out.
+    /// Release the frame next_frame() handed out. The texture stays valid: the
+    /// capture keeps its own reference to the newest one.
     capture_e release_frame();
+
+    /// The newest frame texture, or nullptr before the first frame.
+    ID3D11Texture2D *latest_texture() const;
 
     /// Stop capturing and drop the session.
     void close();
