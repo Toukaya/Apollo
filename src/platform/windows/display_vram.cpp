@@ -20,7 +20,7 @@ extern "C" {
 
 // local includes
 #include "display.h"
-#include "process.h"
+#include "src/process.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
