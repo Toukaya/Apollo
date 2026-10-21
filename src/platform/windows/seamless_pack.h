@@ -1,0 +1,70 @@
+/**
+ * @file src/platform/windows/seamless_pack.h
+ * @brief The packing of a window set into one canvas.
+ * @details Pure and offline: a canvas rectangle and a window set go in, a
+ *          placement plan comes out. No device, no window, no clock, so the same
+ *          function decides the layout the encoder composes and the harness
+ *          checks. The packer owns the cells, which is what removes the stage-3
+ *          overhang shift: a cell no longer has to stay near the window's desktop
+ *          position, so nothing is shifted or cropped to fit.
+ */
+#pragma once
+
+// standard includes
+#include <cstdint>
+#include <vector>
+
+// local includes
+#include "seamless_table.h"
+#include "window_enum.h"
+
+namespace platf::seamless {
+  /// One placed cell, in canvas coordinates.
+  struct pack_cell {
+    std::uint32_t id = 0;
+    std::uint16_t x = 0;
+    std::uint16_t y = 0;
+    std::uint16_t w = 0;
+    std::uint16_t h = 0;
+    std::uint16_t client_w = 0;
+    std::uint16_t client_h = 0;
+    std::uint8_t z = 0;
+    bool whole_window = false;  ///< the window is at or above the degrade edge
+  };
+
+  /// Whether a plan is a whole table or an incremental one.
+  enum class pack_kind : std::uint8_t {
+    none = 0,
+    snapshot = 1,
+    delta = 2,
+  };
+
+  struct pack_plan {
+    bool ok = false;             ///< false when nothing could be placed
+    std::uint16_t canvas_w = 0;
+    std::uint16_t canvas_h = 0;
+    std::vector<pack_cell> cells;  ///< area-descending, ties by id ascending
+    bool degrade = false;          ///< some cell is in whole-window mode
+    pack_kind kind = pack_kind::snapshot;
+    double utilization = 0.0;      ///< sum of cell areas over canvas area
+  };
+
+  /// The degrade edge, as a fraction of the canvas area (60 percent).
+  constexpr double DEGRADE_AREA_FRACTION = 0.60;
+
+  /**
+   * @brief Pack the windows into the canvas.
+   * @param canvas the canvas rectangle the cells are measured from.
+   * @param windows the window set, in any order.
+   * @param previous the plan last sent, or nullptr for a first plan.
+   * @return the plan; `kind` is a snapshot whenever the canvas or the membership
+   *         differs from `previous`, because only a snapshot carries both.
+   * @details Windows are placed in non-increasing area order, ties by id, on a
+   *          shelf: each row's height is the tallest cell in it and the next row
+   *          starts at the current skyline minimum. The placement depends on the
+   *          sorted sizes and ids only, never on the windows' desktop positions,
+   *          so moving one window cannot re-layout the others.
+   */
+  pack_plan pack_windows(const canvas_rect &canvas, const std::vector<window_rec> &windows,
+                         const pack_plan *previous);
+}  // namespace platf::seamless
