@@ -814,7 +814,9 @@ namespace stream {
         // empty table sent over an unacknowledged one would be ignored. The flag
         // is its own, so a session that published and then lost the capture still
         // gets the empty table - that is the stale-client-table case.
-        if (session->seamless_table.empty_sent || session->seamless_table.pending) {
+        if (platf::seamless::fallback_decide(false, session->seamless_table.pending,
+                                             session->seamless_table.empty_sent) ==
+            platf::seamless::fallback_action::none) {
           return;
         }
         static const std::vector<platf::seamless::window_rec> no_windows;
@@ -844,10 +846,16 @@ namespace stream {
         const std::string_view body {reinterpret_cast<const char *>(plaintext.data()),
                                      sizeof(control_header_v2) + wire.size()};
         const auto payload = encode_control(session, body, tagged_cipher);
-        if (!payload.empty() && session->control.peer) {
-          session->broadcast_ref->control_server.send(payload, session->control.peer);
+        if (!payload.empty() && session->control.peer &&
+            session->broadcast_ref->control_server.send(payload, session->control.peer) == 0) {
+          // Burn the one shot only when it actually went out: a fallback while the
+          // peer is gone must be retried, not silently spent.
+          session->seamless_table.empty_sent = true;
         }
-        session->seamless_table.empty_sent = true;
+        else {
+          BOOST_LOG(warning) << "Seamless: the empty fallback table could not be sent, it will be retried"sv;
+          return;
+        }
         BOOST_LOG(info) << "Seamless: the capture side cannot carry the canvas, one empty table sent and publishing stops"sv;
         return;
       }

@@ -55,6 +55,13 @@ namespace platf::seamless {
     compose_ok = available;
   }
 
+  fallback_action fallback_decide(bool avail, bool pending, bool empty_sent) {
+    if (avail || empty_sent || pending) {
+      return fallback_action::none;
+    }
+    return fallback_action::empty_table;
+  }
+
   std::uint32_t crc32_begin() {
     return 0xFFFFFFFFu;
   }

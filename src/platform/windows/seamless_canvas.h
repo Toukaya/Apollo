@@ -77,6 +77,24 @@ namespace platf::seamless {
   bool compose_available();
   void set_compose_available(bool available);
 
+  /// What the publisher does about a fallback, as a decision the offline harness
+  /// can drive: nothing, or one empty table.
+  enum class fallback_action : std::uint8_t { none = 0, empty_table = 1 };
+
+  /**
+   * @brief Decide this tick's fallback action.
+   * @param avail whether the capture side can carry the published canvas.
+   * @param pending whether a version is in flight (an empty table on top of it
+   *        would be ignored).
+   * @param empty_sent whether the empty table of this session already went out;
+   *        the caller sets it only after the send succeeded, so a fallback while
+   *        the peer is gone retries instead of burning the one shot.
+   * @details Exactly one empty table per session, never on top of an in-flight
+   *          version. The table carries the published canvas unchanged, which is
+   *          what lets the client drop its windows.
+   */
+  fallback_action fallback_decide(bool avail, bool pending, bool empty_sent);
+
   /// The standard reflected CRC32 the protocol uses, as a running state so a
   /// rectangle can be hashed row by row (the mapped pitch is not the cell width).
   std::uint32_t crc32_begin();
