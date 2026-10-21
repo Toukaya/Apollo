@@ -10,6 +10,7 @@
 // platform includes
 #include <windows.h>
 #include <dwmapi.h>
+#include <tlhelp32.h>
 
 // local includes
 #include "window_enum.h"
@@ -95,8 +96,20 @@ namespace platf::seamless {
     struct collect_ctx_t {
       std::vector<window_rec> *out;
       DWORD own_pid;
-      std::uint32_t only_pid;
+      const std::vector<std::uint32_t> *only_pids;
     };
+
+    bool in_scope(const collect_ctx_t &ctx, DWORD pid) {
+      if (ctx.only_pids == nullptr || ctx.only_pids->empty()) {
+        return true;  // no scope: every window, the pre-scope behaviour
+      }
+      for (const auto id : *ctx.only_pids) {
+        if (id == pid) {
+          return true;
+        }
+      }
+      return false;
+    }
 
     /// The title is truncated to the protocol limit, in bytes, before hashing.
     constexpr std::size_t TITLE_LIMIT = SEAMLESS_MAX_TITLE;
@@ -170,9 +183,9 @@ namespace platf::seamless {
       DWORD pid = 0;
       GetWindowThreadProcessId(hwnd, &pid);
 
-      // Scoped to the launched app when the caller asks for it: a user picking
-      // one app gets that app's windows (and its own children), nothing else.
-      if (ctx->only_pid != 0 && pid != ctx->only_pid) {
+      // Scoped to the launched app's process set when the caller asks for it: a
+      // user picking one app gets that app's windows and its own processes.
+      if (!in_scope(*ctx, pid)) {
         return TRUE;
       }
 
@@ -287,11 +300,50 @@ namespace platf::seamless {
     return true;
   }
 
-  bool snapshot(std::vector<window_rec> &out, std::uint32_t only_pid) {
+  std::vector<std::uint32_t> process_tree(std::uint32_t root) {
+    std::vector<std::uint32_t> tree;
+    if (root == 0) {
+      return tree;
+    }
+    tree.push_back(root);
+
+    // Grow the set until it stops changing: every process whose parent is already
+    // in the tree belongs to the launched app.
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+      return tree;
+    }
+
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    bool grew = true;
+    while (grew) {
+      grew = false;
+      if (!Process32FirstW(snapshot, &entry)) {
+        break;
+      }
+      do {
+        bool parentKnown = false, selfKnown = false;
+        for (const auto id : tree) {
+          if (id == entry.th32ParentProcessID) parentKnown = true;
+          if (id == entry.th32ProcessID) selfKnown = true;
+        }
+        if (parentKnown && !selfKnown) {
+          tree.push_back(entry.th32ProcessID);
+          grew = true;
+        }
+      } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return tree;
+  }
+
+  bool snapshot(std::vector<window_rec> &out, const std::vector<std::uint32_t> &only_pids) {
     out.clear();
 
     const auto own_pid = GetCurrentProcessId();
-    collect_ctx_t ctx {&out, own_pid, only_pid};
+    collect_ctx_t ctx {&out, own_pid, &only_pids};
 
     if (!EnumWindows(collect_proc, reinterpret_cast<LPARAM>(&ctx))) {
       out.clear();

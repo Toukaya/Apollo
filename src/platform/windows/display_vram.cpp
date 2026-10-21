@@ -1657,7 +1657,8 @@ namespace platf::dxgi {
           now - seamless_last_enum >= std::chrono::milliseconds(platf::seamless::POLL_INTERVAL_MS)) {
         std::vector<platf::seamless::window_rec> refreshed;
         // One scope, shared with the publisher: the launched app's process.
-        if (!platf::seamless::snapshot(refreshed, proc::proc.pid())) {
+        const auto scope = platf::seamless::process_tree(proc::proc.pid());
+        if (!platf::seamless::snapshot(refreshed, scope)) {
           return capture_e::error;
         }
         seamless_windows = std::move(refreshed);

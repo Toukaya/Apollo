@@ -907,7 +907,10 @@ namespace stream {
       // The table is scoped to the app this host launched: a user picking one app
       // gets that app's windows, not every window on the desktop. The compose
       // asks the same question with the same pid.
-      if (!platf::seamless::snapshot(windows, proc::proc.pid())) {
+      // The scope is the launched app's process tree: the app and its own
+      // processes. A second launch appends its tree through the same call.
+      const auto scope = platf::seamless::process_tree(proc::proc.pid());
+      if (!platf::seamless::snapshot(windows, scope)) {
         BOOST_LOG(warning) << "Seamless: window enumeration failed"sv;
         return;
       }

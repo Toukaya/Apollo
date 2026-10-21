@@ -64,7 +64,14 @@ namespace platf::seamless {
    *          invisible resize border. When only_pid is non-zero the set is scoped
    *          to that process: the app the user launched, and its own windows.
    */
-  bool snapshot(std::vector<window_rec> &out, std::uint32_t only_pid = 0);
+  bool snapshot(std::vector<window_rec> &out, const std::vector<std::uint32_t> &only_pids = {});
+
+  /**
+   * @brief The processes the table is scoped to: the launched app and every
+   *        process that belongs to it (its own children, so helpers and modals
+   *        come along). A second launch appends its tree to the caller's set.
+   */
+  std::vector<std::uint32_t> process_tree(std::uint32_t root);
 
   /**
    * @brief Install the change hooks and the fallback poll.
