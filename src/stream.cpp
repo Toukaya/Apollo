@@ -739,7 +739,7 @@ namespace stream {
 
           // Kind 5 is a close: the operator's ruling added it as a VALUE of this
           // message's existing kind field (no layout change, kinds 0-4 untouched).
-          // The id resolves against the scoped table with the same low-byte rule
+          // The id resolves against the scoped table with the same INDEX rule
           // and the same ambiguity refusal as the focus message.
           if (bytes[2] == SEAMLESS_INTENT_CLOSE) {
             HWND target = nullptr;
