@@ -15,9 +15,14 @@
 #include <winrt/windows.graphics.capture.h>
 
 // local includes
+#include <map>
+#include <memory>
+
 #include "src/platform/common.h"
 #include "src/utility.h"
 #include "src/video.h"
+#include "seamless_canvas.h"
+#include "display_wgc_window.h"
 
 namespace platf::dxgi {
   extern const char *format_str[];
@@ -379,6 +384,23 @@ namespace platf::dxgi {
    */
   class display_wgc_vram_t: public display_vram_t {
     wgc_capture_t dup;
+
+    // The seamless canvas. One capture per published window, the set the last
+    // pass composed, and the persistent canvas the cells are copied into so a
+    // window with no new frame keeps showing its content.
+    bool seamless_enabled = false;
+    int seamless_framerate = 0;
+    platf::seamless::canvas_rect seamless_canvas {};
+    std::map<std::uint32_t, std::unique_ptr<platf::seamless::window_capture_t>> seamless_captures;
+    std::vector<platf::seamless::window_rec> seamless_composed;
+    texture2d_t seamless_canvas_texture;
+    bool seamless_hdr_unsupported = false;
+    // The bit-correct instrument: measurement only, off unless asked for.
+    bool seamless_compare = false;
+    std::vector<platf::seamless::window_rec> seamless_windows;
+    std::chrono::steady_clock::time_point seamless_last_enum {};
+    std::uint32_t seamless_compare_frame = 0;
+    texture2d_t seamless_staging;
 
   public:
     int init(const ::video::config_t &config, const std::string &display_name);

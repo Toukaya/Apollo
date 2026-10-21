@@ -38,7 +38,8 @@ namespace platf::seamless {
    * @details The origin is the virtual desktop's own top left corner, so a cell
    *          coordinate is a positive offset inside the canvas. Packing is a
    *          later stage: until it exists the canvas is the desktop rectangle
-   *          itself, not a rearranged one.
+   *          itself, not a rearranged one, and it is the same rectangle for the
+   *          whole session so a delta never has to restate it.
    */
   struct canvas_rect {
     std::int16_t x = 0;
@@ -53,16 +54,18 @@ namespace platf::seamless {
   /**
    * @brief Fill one wire entry from a window record.
    * @param canvas the virtual desktop rectangle a cell is measured from.
-   * @param area the work area a cell is clipped to.
    * @param out receives the entry.
-   * @return false when the window keeps no cell inside the canvas.
-   * @details The cell of a window is its own desktop rectangle clipped to the
-   *          work area, which is the region a window can be drawn in. A window
-   *          that is entirely outside that region has nothing to draw and is
-   *          left out of the table; stage-4 packing is what gives it a cell.
+   * @return false when the window has no cell inside the canvas.
+   * @details The cell of a window is its own rectangle, never a crop of it: the
+   *          cell size equals the client size, so the texture the host copies
+   *          into the cell and the rectangle the client samples cannot disagree
+   *          and no window is ever drawn stretched. A window that hangs over an
+   *          edge of the desktop keeps its whole rectangle and its cell is
+   *          shifted to stay inside the canvas, by at most the overhang, until
+   *          packing owns the layout; a window wider or taller than the canvas
+   *          has no cell and is left out of the table.
    */
-  bool to_entry(const window_rec &rec, const canvas_rect &canvas, const work_area_t &area,
-                LiSeamlessWindowEntry &out);
+  bool to_entry(const window_rec &rec, const canvas_rect &canvas, LiSeamlessWindowEntry &out);
 
   /**
    * @brief The delta between two sets.
@@ -86,6 +89,9 @@ namespace platf::seamless {
     bool sent_once = false;        ///< the first publish is always a snapshot
     std::vector<window_rec> published;  ///< the set the client last acknowledged
     std::vector<window_rec> inflight;   ///< the set sent with the version in flight
+    canvas_rect canvas {};              ///< the canvas of the last sent version
+    bool empty_sent = false;            ///< the empty table of a fallback has gone out
+    std::vector<std::uint32_t> icons_sent;  ///< hashes whose icon already went out
   };
 
   /**
@@ -94,7 +100,6 @@ namespace platf::seamless {
    * @param cur the current window set.
    * @param now_ms a monotonic millisecond clock.
    * @param canvas the virtual desktop rectangle the cells are measured from.
-   * @param area the work area the cells are clipped to.
    * @param out_kind receives 0 for nothing, 1 for a snapshot, 2 for a delta.
    * @param out_seq receives the sequence number of the published version.
    * @param out_mask receives the delta mask.
@@ -106,10 +111,13 @@ namespace platf::seamless {
    *          timeout re-sends the SAME version, so a lost acknowledgement costs
    *          one second and never a divergent table. The set that goes out with
    *          the version is kept in the state, because that set, and not a set
-   *          read later, is what the client's acknowledgement applies to.
+   *          read later, is what the client's acknowledgement applies to. A
+   *          canvas that differs from the last sent one forces a snapshot: a
+   *          delta carries no canvas, so the cells of a delta would be read
+   *          against the wrong rectangle.
    */
   bool plan_publish(table_state &state, const std::vector<window_rec> &cur, std::int64_t now_ms,
-                    const canvas_rect &canvas, const work_area_t &area,
+                    const canvas_rect &canvas,
                     int &out_kind, std::uint8_t &out_seq, std::uint8_t &out_mask,
                     std::vector<LiSeamlessWindowEntry> &out_entries);
 

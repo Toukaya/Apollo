@@ -1052,6 +1052,8 @@ namespace rtsp_stream {
       config.minRequiredFecPackets = util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       config.mlFeatureFlags = util::from_view(args.at("x-ml-general.featureFlags"sv));
       config.seamless_enabled = seamless::session_enabled(config.mlFeatureFlags);
+      // The capture path reads the flag from the monitor config it is handed.
+      config.monitor.seamless = config.seamless_enabled;
       if (config.seamless_enabled) {
         // The shared protocol layer holds one flag for the channel. It is off
         // until a session negotiates, so the shared send path cannot be used by

@@ -4,11 +4,13 @@
  */
 // standard includes
 #include <algorithm>
+#include <map>
 #include <cstring>
 
 // platform includes
 #include <windows.h>
 #include <dwmapi.h>
+#include <tlhelp32.h>
 
 // local includes
 #include "window_enum.h"
@@ -19,6 +21,96 @@ using namespace std::literals;
 
 namespace platf::seamless {
   namespace {
+    std::map<std::uint32_t, std::vector<std::uint8_t>> g_icons;
+
+    /// FNV-1a over the icon bytes: the wire carries this hash, never the pixels.
+    std::uint32_t hash_bytes(const std::uint8_t *data, std::size_t length) {
+      std::uint32_t hash = 2166136261u;
+      for (std::size_t i = 0; i < length; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+      }
+      return hash;
+    }
+
+    /**
+     * @brief Draw one window icon into a 32 by 32 BGRA buffer.
+     * @details The compositor hands out HICONs in two shapes: 32-bit with alpha,
+     *          and 1-bit masked. DrawIconEx fills a 32-bit DIB for both; the
+     *          masked ones come back with every alpha byte at zero, so the alpha
+     *          pass below reconstructs it from the colour (a transparent pixel in a
+     *          masked icon is black with the mask bit set).
+     */
+    bool extract_icon(HICON icon, std::vector<std::uint8_t> &out) {
+      if (icon == nullptr) {
+        return false;
+      }
+
+      BITMAPINFO info {};
+      info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+      info.bmiHeader.biWidth = ICON_SIZE;
+      info.bmiHeader.biHeight = -ICON_SIZE;  // top down
+      info.bmiHeader.biPlanes = 1;
+      info.bmiHeader.biBitCount = 32;
+      info.bmiHeader.biCompression = BI_RGB;
+
+      HDC dc = CreateCompatibleDC(nullptr);
+      if (dc == nullptr) {
+        return false;
+      }
+
+      void *bits = nullptr;
+      HBITMAP dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+      if (dib == nullptr || bits == nullptr) {
+        DeleteDC(dc);
+        return false;
+      }
+
+      HGDIOBJ previous = SelectObject(dc, dib);
+      DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, nullptr, DI_NORMAL);
+      SelectObject(dc, previous);
+
+      out.assign(static_cast<std::uint8_t *>(bits), static_cast<std::uint8_t *>(bits) + ICON_SIZE * ICON_SIZE * 4);
+
+      bool anyAlpha = false;
+      for (std::size_t i = 3; i < out.size(); i += 4) {
+        if (out[i] != 0) {
+          anyAlpha = true;
+          break;
+        }
+      }
+      if (!anyAlpha) {
+        for (std::size_t i = 0; i < out.size(); i += 4) {
+          const bool transparent = out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 0;
+          out[i + 3] = transparent ? 0 : 255;
+        }
+      }
+
+      DeleteObject(dib);
+      DeleteDC(dc);
+      return true;
+    }
+
+    /// What the enumeration callback needs: the output, this process, and the
+    /// optional app the table is scoped to.
+    struct collect_ctx_t {
+      std::vector<window_rec> *out;
+      DWORD own_pid;
+      const std::vector<std::uint32_t> *only_pids;
+    };
+
+    bool in_scope(const collect_ctx_t &ctx, DWORD pid) {
+      if (ctx.only_pids == nullptr || ctx.only_pids->empty()) {
+        return true;  // no scope: every window, the pre-scope behaviour
+      }
+      for (const auto id : *ctx.only_pids) {
+        if (id == pid) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     /// The title is truncated to the protocol limit, in bytes, before hashing.
     constexpr std::size_t TITLE_LIMIT = SEAMLESS_MAX_TITLE;
 
@@ -79,10 +171,10 @@ namespace platf::seamless {
      *          says 0 is the bottom.
      */
     BOOL CALLBACK collect_proc(HWND hwnd, LPARAM param) {
-      auto *ctx = reinterpret_cast<std::pair<std::vector<window_rec> *, DWORD> *>(param);
+      auto *ctx = reinterpret_cast<collect_ctx_t *>(param);
 
       RECT bounds {};
-      if (!is_candidate(hwnd, ctx->second, bounds)) {
+      if (!is_candidate(hwnd, ctx->own_pid, bounds)) {
         return TRUE;
       }
 
@@ -90,6 +182,13 @@ namespace platf::seamless {
       rec.id = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(hwnd));
       DWORD pid = 0;
       GetWindowThreadProcessId(hwnd, &pid);
+
+      // Scoped to the launched app's process set when the caller asks for it: a
+      // user picking one app gets that app's windows and its own processes.
+      if (!in_scope(*ctx, pid)) {
+        return TRUE;
+      }
+
       rec.pid = static_cast<std::uint32_t>(pid);
       rec.x = static_cast<std::int16_t>(bounds.left);
       rec.y = static_cast<std::int16_t>(bounds.top);
@@ -107,10 +206,28 @@ namespace platf::seamless {
       const auto ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
       rec.flags |= state_bits(IsIconic(hwnd) != 0, IsZoomed(hwnd) != 0,
                               (ex_style & WS_EX_TOPMOST) != 0);
+
+      // The icon: WM_GETICON first, then the class icon. Only the hash crosses the
+      // wire, and only once per hash.
+      HICON icon = reinterpret_cast<HICON>(SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0,
+                                                               SMTO_ABORTIFHUNG, 100, nullptr));
+      if (icon == nullptr) {
+        icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICONSM));
+      }
+      if (icon == nullptr) {
+        icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICON));
+      }
+
+      std::vector<std::uint8_t> iconPixels;
+      if (extract_icon(icon, iconPixels) && iconPixels.size() == ICON_SIZE * ICON_SIZE * 4) {
+        rec.icon_hash = hash_bytes(iconPixels.data(), iconPixels.size());
+        g_icons[rec.icon_hash] = std::move(iconPixels);
+        rec.flags |= SEAMLESS_WF_HAS_ICON;
+      }
       rec.flags |= SEAMLESS_WF_VISIBLE;
       rec.flags |= SEAMLESS_WF_CAPTURABLE;
 
-      ctx->first->push_back(std::move(rec));
+      ctx->out->push_back(std::move(rec));
       return TRUE;
     }
 
@@ -174,11 +291,59 @@ namespace platf::seamless {
     return hash;
   }
 
-  bool snapshot(std::vector<window_rec> &out) {
+  bool icon_bytes(std::uint32_t icon_hash, std::vector<std::uint8_t> &out) {
+    const auto it = g_icons.find(icon_hash);
+    if (it == g_icons.end()) {
+      return false;
+    }
+    out = it->second;
+    return true;
+  }
+
+  std::vector<std::uint32_t> process_tree(std::uint32_t root) {
+    std::vector<std::uint32_t> tree;
+    if (root == 0) {
+      return tree;
+    }
+    tree.push_back(root);
+
+    // Grow the set until it stops changing: every process whose parent is already
+    // in the tree belongs to the launched app.
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+      return tree;
+    }
+
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    bool grew = true;
+    while (grew) {
+      grew = false;
+      if (!Process32FirstW(snapshot, &entry)) {
+        break;
+      }
+      do {
+        bool parentKnown = false, selfKnown = false;
+        for (const auto id : tree) {
+          if (id == entry.th32ParentProcessID) parentKnown = true;
+          if (id == entry.th32ProcessID) selfKnown = true;
+        }
+        if (parentKnown && !selfKnown) {
+          tree.push_back(entry.th32ProcessID);
+          grew = true;
+        }
+      } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return tree;
+  }
+
+  bool snapshot(std::vector<window_rec> &out, const std::vector<std::uint32_t> &only_pids) {
     out.clear();
 
     const auto own_pid = GetCurrentProcessId();
-    std::pair<std::vector<window_rec> *, DWORD> ctx {&out, own_pid};
+    collect_ctx_t ctx {&out, own_pid, &only_pids};
 
     if (!EnumWindows(collect_proc, reinterpret_cast<LPARAM>(&ctx))) {
       out.clear();

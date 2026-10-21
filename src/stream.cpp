@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <future>
@@ -26,6 +27,7 @@ extern "C" {
 #include "crypto.h"
 #include "display_device.h"
 #include "globals.h"
+#include "platform/windows/seamless_canvas.h"
 #include "platform/windows/seamless_table.h"
 #include "platform/windows/window_enum.h"
 #include "input.h"
@@ -726,7 +728,7 @@ namespace stream {
             BOOST_LOG(warning) << "Seamless: intent message of "sv << length << " bytes dropped"sv;
             return;
           }
-          if (bytes[2] > SEAMLESS_INTENT_STICKY) {
+          if (bytes[2] > SEAMLESS_INTENT_CLOSE) {
             BOOST_LOG(warning) << "Seamless: intent kind "sv << (int) bytes[2] << " dropped"sv;
             return;
           }
@@ -734,6 +736,28 @@ namespace stream {
                              << " kind="sv << (int) bytes[2]
                              << " rect="sv << rdi16(bytes + 3) << ',' << rdi16(bytes + 5) << ' '
                              << rd16(bytes + 7) << 'x' << rd16(bytes + 9);
+
+          // Kind 5 is a close: the operator's ruling added it as a VALUE of this
+          // message's existing kind field (no layout change, kinds 0-4 untouched).
+          // The id resolves against the scoped table with the same INDEX rule
+          // and the same ambiguity refusal as the focus message.
+          if (bytes[2] == SEAMLESS_INTENT_CLOSE) {
+            HWND target = nullptr;
+            int matches = 0;
+            if (bytes[1] < session->seamless_table.published.size()) {
+              target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(
+                session->seamless_table.published[bytes[1]].id));
+              matches = 1;
+            }
+            if (target != nullptr && matches == 1) {
+              SendNotifyMessageW(target, WM_CLOSE, 0, 0);
+              BOOST_LOG(info) << "Seamless: close intent applied to window="sv << (int) bytes[1];
+            }
+            else {
+              BOOST_LOG(warning) << "Seamless: close intent for window="sv << (int) bytes[1]
+                                 << " matched "sv << matches << " windows, dropped"sv;
+            }
+          }
           break;
         }
 
@@ -742,8 +766,38 @@ namespace stream {
             BOOST_LOG(warning) << "Seamless: input message of "sv << length << " bytes dropped"sv;
             return;
           }
-          BOOST_LOG(verbose) << "Seamless: input window="sv << (int) bytes[1]
-                             << " mode="sv << (int) bytes[2] << " pid="sv << rd32(bytes + 3);
+
+          // Apply the focus the client asked for, on a window the scoped table
+          // holds. The wire's id field is one byte while an entry id is four, so
+          // the match is on the low byte and an ambiguous one is refused rather
+          // than guessed at.
+          // The byte is a WINDOW INDEX into the set the client holds: the table
+          // caps at 32 entries, so the index is unique and fits the field, and
+          // `published` (not `inflight`, which an ack clears) is that set.
+          const auto wanted = bytes[1];
+          HWND target = nullptr;
+          int matches = 0;
+          if (wanted < session->seamless_table.published.size()) {
+            target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(
+              session->seamless_table.published[wanted].id));
+            matches = 1;
+          }
+
+          if (target != nullptr && matches == 1) {
+            const auto rec_target_for_log = [](HWND h) { return reinterpret_cast<std::uintptr_t>(h); };
+            if (bytes[2] == SEAMLESS_INPUT_FOCUS_RAISE) {
+              BringWindowToTop(target);
+            }
+            if (GetForegroundWindow() != target) {
+              SetForegroundWindow(target);
+            }
+            BOOST_LOG(verbose) << "Seamless: input window="sv << (int) wanted << " mode="sv << (int) bytes[2]
+                               << " applied to 0x"sv << util::hex(rec_target_for_log(target)).to_string_view();
+          }
+          else {
+            BOOST_LOG(warning) << "Seamless: input for window="sv << (int) wanted
+                               << " matched "sv << matches << " windows, dropped"sv;
+          }
           break;
         }
 
@@ -757,7 +811,14 @@ namespace stream {
           // applies to the version that was sent, which the table state kept,
           // so this handler never reads the window set again: a window that
           // changed while the version was in flight must still be sent.
-          platf::seamless::apply_ack(session->seamless_table, bytes[1], bytes[2]);
+          {
+            const bool matched = platf::seamless::apply_ack(session->seamless_table, bytes[1], bytes[2]);
+            // The host half of the end-to-end ack line: what arrived and whether
+            // the sequence moved because of it.
+            BOOST_LOG(info) << "Seamless: ack received seq="sv << (int) bytes[1] << " result="sv << (int) bytes[2]
+                            << " matched="sv << (matched ? 1 : 0) << " seq_now="sv
+                            << (int) session->seamless_table.seq;
+          }
           break;
         }
 
@@ -802,13 +863,84 @@ namespace stream {
       if (!session->config.seamless_enabled) {
         return;
       }
+
+      // The capture side owns the canvas. When it cannot carry the published
+      // canvas (a fallback), cells measured against the published rectangle would
+      // land in a texture of a different size. The publisher then sends exactly
+      // one empty table - same canvas, no entries - and stops, so the client
+      // drops its windows and the desktop composite is what the user sees.
+      if (!platf::seamless::compose_available()) {
+        // Once per session, and never on top of a version still in flight: an
+        // empty table sent over an unacknowledged one would be ignored. The flag
+        // is its own, so a session that published and then lost the capture still
+        // gets the empty table - that is the stale-client-table case.
+        if (platf::seamless::fallback_decide(false, session->seamless_table.pending,
+                                             session->seamless_table.empty_sent) ==
+            platf::seamless::fallback_action::none) {
+          return;
+        }
+        static const std::vector<platf::seamless::window_rec> no_windows;
+        int kind = 0;
+        std::uint8_t seq = 0;
+        std::uint8_t mask = 0;
+        std::vector<LiSeamlessWindowEntry> entries;
+        const auto canvas = platf::seamless::virtual_canvas();
+        const auto area = platf::seamless::virtual_work_area();
+        if (!platf::seamless::plan_publish(session->seamless_table, no_windows, now_ms, canvas,
+                                           kind, seq, mask, entries)) {
+          return;
+        }
+        std::vector<std::uint8_t> wire;
+        if (!platf::seamless::encode_publish(session->seamless_table, no_windows, now_ms, canvas, area,
+                                            kind, seq, mask, wire)) {
+          return;
+        }
+        std::array<std::uint8_t, sizeof(control_header_v2) + MAX_SEAMLESS_MESSAGE> plaintext {};
+        auto *header = reinterpret_cast<control_header_v2 *>(plaintext.data());
+        header->type = SEAMLESS_PACKET_TYPE;
+        header->payloadLength = static_cast<std::uint16_t>(wire.size());
+        std::copy(wire.begin(), wire.end(), plaintext.begin() + sizeof(control_header_v2));
+        std::array<std::uint8_t,
+          sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + MAX_SEAMLESS_MESSAGE) + crypto::cipher::tag_size>
+          tagged_cipher;
+        const std::string_view body {reinterpret_cast<const char *>(plaintext.data()),
+                                     sizeof(control_header_v2) + wire.size()};
+        const auto payload = encode_control(session, body, tagged_cipher);
+        if (!payload.empty() && session->control.peer &&
+            session->broadcast_ref->control_server.send(payload, session->control.peer) == 0) {
+          // Burn the one shot only when it actually went out: a fallback while the
+          // peer is gone must be retried, not silently spent.
+          session->seamless_table.empty_sent = true;
+        }
+        else {
+          BOOST_LOG(warning) << "Seamless: the empty fallback table could not be sent, it will be retried"sv;
+          return;
+        }
+        // D5: the same line carries the canvas and the entry count, so the reading
+        // procedure can assert both without joining two sources.
+        BOOST_LOG(info) << "Seamless: the capture side cannot carry the canvas, one empty table sent and publishing stops"
+                        << " canvas="sv << canvas.w << 'x' << canvas.h << " entries=0"sv;
+        return;
+      }
       if (now_ms - session->seamless_last_poll_ms < platf::seamless::POLL_INTERVAL_MS) {
         return;
       }
       session->seamless_last_poll_ms = now_ms;
 
       std::vector<platf::seamless::window_rec> windows;
-      if (!platf::seamless::snapshot(windows)) {
+      // The table is scoped to the app this host launched: a user picking one app
+      // gets that app's windows, not every window on the desktop. The compose
+      // asks the same question with the same pid.
+      // The scope is the launched app's process tree: the app and its own
+      // processes. A second launch appends its tree through the same call.
+      // The scope is the UNION of every launched app's process tree: a second
+      // pick appends to the launched set, so its windows join the table.
+      std::vector<std::uint32_t> scope;
+      for (const auto root : proc::proc.launched_pids()) {
+        const auto tree = platf::seamless::process_tree(root);
+        scope.insert(scope.end(), tree.begin(), tree.end());
+      }
+      if (!platf::seamless::snapshot(windows, scope)) {
         BOOST_LOG(warning) << "Seamless: window enumeration failed"sv;
         return;
       }
@@ -863,6 +995,56 @@ namespace stream {
         session->seamless_table.inflight.clear();
         BOOST_LOG(warning) << "Seamless: table send failed: "sv << sent;
         return;
+      }
+
+      // The icons the table references, once per hash: the wire carries the
+      // 32x32 BGRA bytes inside the protocol's cap, and the client serves them by
+      // the same hash the entry carries.
+      for (const auto &rec : windows) {
+        if (rec.icon_hash == 0) {
+          continue;
+        }
+        auto &sentIcons = session->seamless_table.icons_sent;
+        if (std::find(sentIcons.begin(), sentIcons.end(), rec.icon_hash) != sentIcons.end()) {
+          continue;
+        }
+        std::vector<std::uint8_t> pixels;
+        if (!platf::seamless::icon_bytes(rec.icon_hash, pixels) ||
+            pixels.size() > SEAMLESS_MAX_ICON) {
+          // Never silent: an over-cap icon would otherwise read as a blank tile
+          // with no error on a live session.
+          BOOST_LOG(warning) << "Seamless: icon 0x"sv << util::hex(rec.icon_hash).to_string_view()
+                             << " skipped, "sv << pixels.size() << " bytes over the "sv
+                             << SEAMLESS_MAX_ICON << " cap"sv;
+          continue;
+        }
+        std::vector<std::uint8_t> icon(SEAMLESS_ICON_HEADER_SIZE + pixels.size());
+        icon[0] = SEAMLESS_MSG_ICON;
+        for (int b = 0; b < 4; b++) {
+          icon[1 + b] = (std::uint8_t) ((rec.icon_hash >> (8 * b)) & 0xFFu);
+        }
+        icon[5] = (std::uint8_t) (pixels.size() & 0xFFu);
+        icon[6] = (std::uint8_t) ((pixels.size() >> 8) & 0xFFu);
+        std::copy(pixels.begin(), pixels.end(), icon.begin() + SEAMLESS_ICON_HEADER_SIZE);
+
+        std::array<std::uint8_t, sizeof(control_header_v2) + SEAMLESS_ICON_HEADER_SIZE + SEAMLESS_MAX_ICON> iconPlain {};
+        auto *iconHeader = reinterpret_cast<control_header_v2 *>(iconPlain.data());
+        iconHeader->type = SEAMLESS_PACKET_TYPE;
+        iconHeader->payloadLength = static_cast<std::uint16_t>(icon.size());
+        std::copy(icon.begin(), icon.end(), iconPlain.begin() + sizeof(control_header_v2));
+
+        std::array<std::uint8_t,
+          sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + SEAMLESS_ICON_HEADER_SIZE + SEAMLESS_MAX_ICON) + crypto::cipher::tag_size>
+          iconCipher;
+        const std::string_view iconBody {reinterpret_cast<const char *>(iconPlain.data()),
+                                         sizeof(control_header_v2) + icon.size()};
+        const auto iconPayload = encode_control(session, iconBody, iconCipher);
+        if (!iconPayload.empty() && session->control.peer &&
+            session->broadcast_ref->control_server.send(iconPayload, session->control.peer) == 0) {
+          sentIcons.push_back(rec.icon_hash);
+          BOOST_LOG(info) << "Seamless: icon hash=0x"sv << util::hex(rec.icon_hash).to_string_view()
+                          << " bytes="sv << pixels.size();
+        }
       }
 
       BOOST_LOG(verbose) << "Seamless: "sv << (kind == 1 ? "snapshot"sv : "delta"sv)

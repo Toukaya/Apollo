@@ -20,6 +20,7 @@ extern "C" {
 
 // local includes
 #include "display.h"
+#include "src/process.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
@@ -1647,6 +1648,181 @@ namespace platf::dxgi {
    * @param cursor_visible
    */
   capture_e display_wgc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (seamless_enabled) {
+      // The canvas is composed from the windows' own surfaces. The desktop is not
+      // captured while the channel is open, and a pass with nothing new is a
+      // timeout, so the existing skip path runs and no blank frame is encoded.
+      const auto now = std::chrono::steady_clock::now();
+      if (seamless_windows.empty() ||
+          now - seamless_last_enum >= std::chrono::milliseconds(platf::seamless::POLL_INTERVAL_MS)) {
+        std::vector<platf::seamless::window_rec> refreshed;
+        // One scope, shared with the publisher: the launched app's process.
+        // The union over every launched root, the same scope the publisher uses.
+        std::vector<std::uint32_t> scope;
+        for (const auto root : proc::proc.launched_pids()) {
+          const auto tree = platf::seamless::process_tree(root);
+          scope.insert(scope.end(), tree.begin(), tree.end());
+        }
+        if (!platf::seamless::snapshot(refreshed, scope)) {
+          return capture_e::error;
+        }
+        seamless_windows = std::move(refreshed);
+        seamless_last_enum = now;
+      }
+      const std::vector<platf::seamless::window_rec> &windows = seamless_windows;
+
+      // One capture per published window; a window that left the table drops its
+      // capture and the cell it owned.
+      for (auto it = seamless_captures.begin(); it != seamless_captures.end();) {
+        bool present = false;
+        for (const auto &rec : windows) {
+          if (rec.id == it->first) {
+            present = true;
+            break;
+          }
+        }
+        if (present) {
+          ++it;
+        }
+        else {
+          it = seamless_captures.erase(it);
+        }
+      }
+
+      std::vector<std::uint32_t> dirty;
+      for (const auto &rec : windows) {
+        auto it = seamless_captures.find(rec.id);
+        if (it == seamless_captures.end()) {
+          auto capture = std::make_unique<platf::seamless::window_capture_t>();
+          if (capture->init(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(rec.id)), device.get(), seamless_framerate) != 0) {
+            continue;
+          }
+          it = seamless_captures.emplace(rec.id, std::move(capture)).first;
+        }
+
+        ID3D11Texture2D *frame = nullptr;
+        std::uint64_t frame_time = 0;
+        if (it->second->next_frame(std::chrono::milliseconds(0), &frame, frame_time) == capture_e::ok && frame != nullptr) {
+          dirty.push_back(rec.id);
+        }
+      }
+
+      auto plan = platf::seamless::plan_compose(seamless_canvas, seamless_composed, windows, dirty);
+      for (auto &pair : seamless_captures) {
+        pair.second->release_frame();
+      }
+
+      if (!plan.changed) {
+        return capture_e::timeout;
+      }
+
+      if (!seamless_canvas_texture) {
+        D3D11_TEXTURE2D_DESC desc {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &seamless_canvas_texture))) {
+          BOOST_LOG(error) << "Seamless: cannot create the canvas texture"sv;
+          return capture_e::error;
+        }
+      }
+
+      std::shared_ptr<platf::img_t> img;
+      if (!pull_free_image_cb(img)) {
+        return capture_e::interrupted;
+      }
+
+      auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+      d3d_img->blank = false;
+      if (complete_img(d3d_img.get(), false) != 0) {
+        return capture_e::error;
+      }
+
+      {
+        texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+        if (!lock_helper.lock()) {
+          BOOST_LOG(error) << "Failed to lock capture texture"sv;
+          return capture_e::error;
+        }
+
+        // Every cell is copied every pass; the plan only decided whether the
+        // pass is worth encoding.
+        std::vector<platf::seamless::canvas_copy> copies;
+        copies.reserve(plan.cells.size());
+        for (const auto &cell : plan.cells) {
+          auto capture = seamless_captures.find(cell.id);
+          if (capture == seamless_captures.end()) {
+            continue;
+          }
+          ID3D11Texture2D *source = capture->second->latest_texture();
+          if (source == nullptr) {
+            continue;
+          }
+          copies.push_back({source, cell});
+        }
+        platf::seamless::compose_cells(device_ctx.get(), seamless_canvas_texture.get(), copies);
+
+        device_ctx->CopyResource(d3d_img->capture_texture.get(), seamless_canvas_texture.get());
+
+        // QA's bit-correct line: the hash of exactly the pixels this cell holds,
+        // over the same rectangle the client will read back. Measurement only, so
+        // a normal session pays nothing.
+        if (seamless_compare) {
+          if (!seamless_staging) {
+            D3D11_TEXTURE2D_DESC staging_desc {};
+            staging_desc.Width = width;
+            staging_desc.Height = height;
+            staging_desc.MipLevels = 1;
+            staging_desc.ArraySize = 1;
+            staging_desc.SampleDesc.Count = 1;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, &seamless_staging))) {
+              BOOST_LOG(warning) << "Seamless: cannot create the compare staging texture"sv;
+              seamless_compare = false;
+            }
+          }
+
+          if (seamless_compare) {
+            device_ctx->CopyResource(seamless_staging.get(), seamless_canvas_texture.get());
+            D3D11_MAPPED_SUBRESOURCE mapped {};
+            if (SUCCEEDED(device_ctx->Map(seamless_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+              const auto *bytes = static_cast<const std::uint8_t *>(mapped.pData);
+              for (const auto &cell : plan.cells) {
+                // Row by row, on one running state: the mapped pitch is not the
+                // cell width, and combining per-row hashes would not be the same
+                // hash as the contiguous rectangle.
+                std::uint32_t state = platf::seamless::crc32_begin();
+                for (std::uint16_t row = 0; row < cell.h; row++) {
+                  const std::uint8_t *line = bytes + (size_t) (cell.y + row) * mapped.RowPitch + (size_t) cell.x * 4;
+                  state = platf::seamless::crc32_update(state, line, (size_t) cell.w * 4);
+                }
+                const std::uint32_t crc = platf::seamless::crc32_finish(state);
+                BOOST_LOG(info) << "Seamless: compare frame="sv << seamless_compare_frame << " window="sv << cell.id
+                                << " cell="sv << cell.x << ',' << cell.y << ',' << cell.w << 'x' << cell.h
+                                << " hostcrc="sv << util::hex(crc).to_string_view();
+              }
+              device_ctx->Unmap(seamless_staging.get(), 0);
+              seamless_compare_frame++;
+            }
+          }
+        }
+      }
+
+      seamless_composed = windows;
+      img_out = img;
+      if (img_out) {
+        img_out->frame_timestamp = std::chrono::steady_clock::now();
+      }
+      return capture_e::ok;
+    }
+
     texture2d_t src;
     uint64_t frame_qpc;
     dup.set_cursor_visible(cursor_visible);
@@ -1704,6 +1880,49 @@ namespace platf::dxgi {
   }
 
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    seamless_enabled = config.seamless;
+    seamless_framerate = config.framerate;
+    if (seamless_enabled) {
+      // The canvas must come from the same source the table publishes, or the
+      // cells the client samples are measured against a different rectangle than
+      // the texture they are read from.
+      seamless_canvas = platf::seamless::virtual_canvas();
+      if (seamless_canvas.w == 0 || seamless_canvas.h == 0) {
+        BOOST_LOG(warning) << "Seamless: the virtual desktop has no size, the seamless channel is not offered for this session"sv;
+        seamless_enabled = false;
+        platf::seamless::set_compose_available(false);
+      }
+      else if (seamless_canvas.x != 0 || seamless_canvas.y != 0 ||
+               static_cast<int>(seamless_canvas.w) != width || static_cast<int>(seamless_canvas.h) != height) {
+        // The encoder input is this display's image, so the composite can only be
+        // carried when the two rectangles agree. Multi-monitor desktops and
+        // scaled stream sizes do not, and a desktop composite is correct only for
+        // a single foreground window - so this is a named fallback, not silence.
+        BOOST_LOG(warning) << "Seamless: the virtual desktop "sv << seamless_canvas.x << ',' << seamless_canvas.y
+                           << ' ' << seamless_canvas.w << 'x' << seamless_canvas.h
+                           << " is not this display "sv << width << 'x' << height
+                           << "; the seamless channel is not offered for this session and the desktop stream is what the client shows"sv;
+        seamless_enabled = false;
+        // One-sided fallbacks must not stand: the publisher stops too.
+        platf::seamless::set_compose_available(false);
+      }
+      else {
+        platf::seamless::set_compose_available(true);
+      }
+    }
+    {
+      const char *compare = std::getenv("SUNSHINE_SEAMLESS_COMPARE");
+      seamless_compare = compare != nullptr && compare[0] != '0';
+    }
+    if (seamless_enabled && capture_format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+      // The cells are copied with CopySubresourceRegion, which cannot convert a
+      // format; an HDR canvas would need a draw. Stage 3 keeps the desktop path.
+      BOOST_LOG(warning) << "Seamless: capture format 0x"sv << util::hex(capture_format).to_string_view()
+                         << " is not supported by the copy compose, the desktop path stays"sv;
+      seamless_enabled = false;
+      seamless_hdr_unsupported = true;
+    }
+
     if (display_base_t::init(config, display_name) || dup.init(this, config)) {
       return -1;
     }

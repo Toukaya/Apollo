@@ -49,6 +49,10 @@ namespace video {
 
     int encodingFramerate; // Requested display framerate
     bool input_only;
+
+    // The session negotiated the seamless window channel. When it is false the
+    // capture path is exactly what it was before the feature existed.
+    bool seamless = false;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);

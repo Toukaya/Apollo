@@ -29,7 +29,14 @@ namespace platf::seamless {
     std::uint8_t flags = 0;  ///< SEAMLESS_WF_* and the window state bits
     std::wstring title;
     std::uint32_t title_hash = 0;
+    std::uint32_t icon_hash = 0;  ///< hash of the 32x32 BGRA icon, 0 when none
   };
+
+  /// The 32x32 BGRA bytes of an icon, when the host has one for that hash.
+  bool icon_bytes(std::uint32_t icon_hash, std::vector<std::uint8_t> &out);
+
+  /// The icon edge the uplink sends: 32 pixels, 4096 bytes of BGRA.
+  constexpr std::uint16_t ICON_SIZE = 32;
 
   /**
    * @brief The window state bits of the flags byte.
@@ -54,9 +61,17 @@ namespace platf::seamless {
    *          no-activate window, not this process, with a non-empty extended
    *          frame bounds from the desktop compositor. Geometry never comes from
    *          the legacy window rectangle, because that rectangle includes the
-   *          invisible resize border.
+   *          invisible resize border. When only_pid is non-zero the set is scoped
+   *          to that process: the app the user launched, and its own windows.
    */
-  bool snapshot(std::vector<window_rec> &out);
+  bool snapshot(std::vector<window_rec> &out, const std::vector<std::uint32_t> &only_pids = {});
+
+  /**
+   * @brief The processes the table is scoped to: the launched app and every
+   *        process that belongs to it (its own children, so helpers and modals
+   *        come along). A second launch appends its tree to the caller's set.
+   */
+  std::vector<std::uint32_t> process_tree(std::uint32_t root);
 
   /**
    * @brief Install the change hooks and the fallback poll.

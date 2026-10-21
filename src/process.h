@@ -111,6 +111,28 @@ namespace proc {
     bool virtual_display = false;
     bool allow_client_commands = false;
 
+    /// The pid of the process this host launched, or 0 when nothing is running.
+    /// A second launch appends to the launched set instead of replacing it, so
+    /// the seamless scope is the union of these roots.
+    std::uint32_t pid() const {
+      return _process.valid() ? static_cast<std::uint32_t>(_process.id()) : 0;
+    }
+
+    /// Every launched root pid: the current one and the ones a later launch kept
+    /// alive. The window table is scoped to the union of their process trees.
+    std::vector<std::uint32_t> launched_pids() const {
+      std::vector<std::uint32_t> roots;
+      if (_process.valid()) {
+        roots.push_back(static_cast<std::uint32_t>(_process.id()));
+      }
+      for (const auto &kept : _kept_processes) {
+        if (kept.first.valid()) {
+          roots.push_back(static_cast<std::uint32_t>(kept.first.id()));
+        }
+      }
+      return roots;
+    }
+
     proc_t(
       boost::process::v1::environment &&env,
       std::vector<ctx_t> &&apps
@@ -166,6 +188,9 @@ namespace proc {
 
     boost::process::v1::child _process;
     boost::process::v1::group _process_group;
+    // A launched app that a later launch kept alive: a second pick appends here
+    // instead of terminating the first, so two apps coexist on the host.
+    std::vector<std::pair<boost::process::v1::child, boost::process::v1::group>> _kept_processes;
 
     file_t _pipe;
     std::vector<cmd_t>::const_iterator _app_prep_it;
