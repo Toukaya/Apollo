@@ -1880,7 +1880,7 @@ namespace platf::dxgi {
       // the texture they are read from.
       seamless_canvas = platf::seamless::virtual_canvas();
       if (seamless_canvas.w == 0 || seamless_canvas.h == 0) {
-        BOOST_LOG(warning) << "Seamless: the virtual desktop has no size, the channel falls back to the desktop composite"sv;
+        BOOST_LOG(warning) << "Seamless: the virtual desktop has no size, the seamless channel is not offered for this session"sv;
         seamless_enabled = false;
         platf::seamless::set_compose_available(false);
       }
@@ -1893,7 +1893,7 @@ namespace platf::dxgi {
         BOOST_LOG(warning) << "Seamless: the virtual desktop "sv << seamless_canvas.x << ',' << seamless_canvas.y
                            << ' ' << seamless_canvas.w << 'x' << seamless_canvas.h
                            << " is not this display "sv << width << 'x' << height
-                           << "; the channel falls back to the desktop composite, correct only for a single foreground window"sv;
+                           << "; the seamless channel is not offered for this session and the desktop stream is what the client shows"sv;
         seamless_enabled = false;
         // One-sided fallbacks must not stand: the publisher stops too.
         platf::seamless::set_compose_available(false);

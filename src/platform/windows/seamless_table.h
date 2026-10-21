@@ -90,6 +90,7 @@ namespace platf::seamless {
     std::vector<window_rec> published;  ///< the set the client last acknowledged
     std::vector<window_rec> inflight;   ///< the set sent with the version in flight
     canvas_rect canvas {};              ///< the canvas of the last sent version
+    bool empty_sent = false;            ///< the empty table of a fallback has gone out
   };
 
   /**

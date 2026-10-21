@@ -810,7 +810,11 @@ namespace stream {
       // one empty table - same canvas, no entries - and stops, so the client
       // drops its windows and the desktop composite is what the user sees.
       if (!platf::seamless::compose_available()) {
-        if (session->seamless_table.pending || session->seamless_table.sent_once) {
+        // Once per session, and never on top of a version still in flight: an
+        // empty table sent over an unacknowledged one would be ignored. The flag
+        // is its own, so a session that published and then lost the capture still
+        // gets the empty table - that is the stale-client-table case.
+        if (session->seamless_table.empty_sent || session->seamless_table.pending) {
           return;
         }
         static const std::vector<platf::seamless::window_rec> no_windows;
@@ -843,6 +847,7 @@ namespace stream {
         if (!payload.empty() && session->control.peer) {
           session->broadcast_ref->control_server.send(payload, session->control.peer);
         }
+        session->seamless_table.empty_sent = true;
         BOOST_LOG(info) << "Seamless: the capture side cannot carry the canvas, one empty table sent and publishing stops"sv;
         return;
       }

@@ -11,10 +11,12 @@
 
 namespace platf::seamless {
   namespace {
-    // Written once by the capture side when a session starts, read by the
-    // publisher afterwards. A plain bool is enough for a one-way init-time flag
-    // and keeps this translation unit free of the atomic header, which drags in
-    // a pthread chain this harness cannot compile.
+    // Written by the capture side from its init, which reruns on every
+    // capture_e::reinit (a resolution or monitor change), and read by the
+    // publisher on every tick. A plain bool is enough because the writer and the
+    // reader both re-read it per tick and the worst case is one tick of stale
+    // value; the atomic header would drag a pthread chain into this translation
+    // unit that the offline harness cannot compile.
     bool compose_ok = true;
   }
 
