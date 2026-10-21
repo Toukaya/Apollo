@@ -5,11 +5,16 @@
  */
 // standard includes
 #include <algorithm>
+#include <atomic>
 
 // local includes
 #include "seamless_canvas.h"
 
 namespace platf::seamless {
+  namespace {
+    std::atomic<bool> compose_ok {true};
+  }
+
   namespace {
     /// The publishable cells of a window set, bottom of the z order first.
     std::vector<canvas_cell> cells_of(const canvas_rect &canvas, const std::vector<window_rec> &set) {
@@ -36,6 +41,14 @@ namespace platf::seamless {
       return nullptr;
     }
   }  // namespace
+
+  bool compose_available() {
+    return compose_ok.load(std::memory_order_relaxed);
+  }
+
+  void set_compose_available(bool available) {
+    compose_ok.store(available, std::memory_order_relaxed);
+  }
 
   std::uint32_t crc32_begin() {
     return 0xFFFFFFFFu;

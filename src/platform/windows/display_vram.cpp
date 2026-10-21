@@ -1882,6 +1882,7 @@ namespace platf::dxgi {
       if (seamless_canvas.w == 0 || seamless_canvas.h == 0) {
         BOOST_LOG(warning) << "Seamless: the virtual desktop has no size, the channel falls back to the desktop composite"sv;
         seamless_enabled = false;
+        platf::seamless::set_compose_available(false);
       }
       else if (seamless_canvas.x != 0 || seamless_canvas.y != 0 ||
                static_cast<int>(seamless_canvas.w) != width || static_cast<int>(seamless_canvas.h) != height) {
@@ -1894,6 +1895,11 @@ namespace platf::dxgi {
                            << " is not this display "sv << width << 'x' << height
                            << "; the channel falls back to the desktop composite, correct only for a single foreground window"sv;
         seamless_enabled = false;
+        // One-sided fallbacks must not stand: the publisher stops too.
+        platf::seamless::set_compose_available(false);
+      }
+      else {
+        platf::seamless::set_compose_available(true);
       }
     }
     {

@@ -26,6 +26,7 @@ extern "C" {
 #include "crypto.h"
 #include "display_device.h"
 #include "globals.h"
+#include "platform/windows/seamless_canvas.h"
 #include "platform/windows/seamless_table.h"
 #include "platform/windows/window_enum.h"
 #include "input.h"
@@ -800,6 +801,49 @@ namespace stream {
      */
     void publish_tick(session_t *session, std::int64_t now_ms) {
       if (!session->config.seamless_enabled) {
+        return;
+      }
+
+      // The capture side owns the canvas. When it cannot carry the published
+      // canvas (a fallback), cells measured against the published rectangle would
+      // land in a texture of a different size. The publisher then sends exactly
+      // one empty table - same canvas, no entries - and stops, so the client
+      // drops its windows and the desktop composite is what the user sees.
+      if (!platf::seamless::compose_available()) {
+        if (session->seamless_table.pending || session->seamless_table.sent_once) {
+          return;
+        }
+        static const std::vector<platf::seamless::window_rec> no_windows;
+        int kind = 0;
+        std::uint8_t seq = 0;
+        std::uint8_t mask = 0;
+        std::vector<LiSeamlessWindowEntry> entries;
+        const auto canvas = platf::seamless::virtual_canvas();
+        const auto area = platf::seamless::virtual_work_area();
+        if (!platf::seamless::plan_publish(session->seamless_table, no_windows, now_ms, canvas,
+                                           kind, seq, mask, entries)) {
+          return;
+        }
+        std::vector<std::uint8_t> wire;
+        if (!platf::seamless::encode_publish(session->seamless_table, no_windows, now_ms, canvas, area,
+                                            kind, seq, mask, wire)) {
+          return;
+        }
+        std::array<std::uint8_t, sizeof(control_header_v2) + MAX_SEAMLESS_MESSAGE> plaintext {};
+        auto *header = reinterpret_cast<control_header_v2 *>(plaintext.data());
+        header->type = SEAMLESS_PACKET_TYPE;
+        header->payloadLength = static_cast<std::uint16_t>(wire.size());
+        std::copy(wire.begin(), wire.end(), plaintext.begin() + sizeof(control_header_v2));
+        std::array<std::uint8_t,
+          sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + MAX_SEAMLESS_MESSAGE) + crypto::cipher::tag_size>
+          tagged_cipher;
+        const std::string_view body {reinterpret_cast<const char *>(plaintext.data()),
+                                     sizeof(control_header_v2) + wire.size()};
+        const auto payload = encode_control(session, body, tagged_cipher);
+        if (!payload.empty() && session->control.peer) {
+          session->broadcast_ref->control_server.send(payload, session->control.peer);
+        }
+        BOOST_LOG(info) << "Seamless: the capture side cannot carry the canvas, one empty table sent and publishing stops"sv;
         return;
       }
       if (now_ms - session->seamless_last_poll_ms < platf::seamless::POLL_INTERVAL_MS) {

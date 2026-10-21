@@ -364,6 +364,14 @@ namespace platf::seamless {
     winrt::com_ptr<ID3D11Texture2D> last_frame;
     bool running = false;
 
+    // A resized window keeps producing its old surface size unless the pool is
+    // recreated, and the cell the table publishes has already changed size - the
+    // 1:1 copy would then be wrong exactly when the user drags an edge.
+    winrt::IDirect3DDevice device {nullptr};
+    winrt::Windows::Graphics::DirectX::DirectXPixelFormat format {
+      winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized};
+    winrt::Windows::Graphics::SizeInt32 pool_size {0, 0};
+
     ~impl_t() {
       close();
     }
@@ -400,6 +408,19 @@ namespace platf::seamless {
       }
       if (frame == nullptr) {
         return;
+      }
+
+      // The surface size is the one the pool was created with; a resized window
+      // needs a new pool or its frames stop matching the cell.
+      const auto content = frame.ContentSize();
+      if (content.Width != pool_size.Width || content.Height != pool_size.Height) {
+        try {
+          frame_pool.Recreate(device, format, 2, content);
+          pool_size = content;
+        }
+        catch (winrt::hresult_error &e) {
+          BOOST_LOG(warning) << "Seamless: window frame pool recreation failed: 0x"sv << util::hex(e.code()).to_string_view();
+        }
       }
 
       AcquireSRWLockExclusive(&frame_lock);
@@ -450,9 +471,11 @@ namespace platf::seamless {
         return -1;
       }
 
+      _impl->device = uwp_device;
+      _impl->format = winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized;
+      _impl->pool_size = _impl->item.Size();
       _impl->frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
-        uwp_device, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2,
-        _impl->item.Size());
+        uwp_device, _impl->format, 2, _impl->pool_size);
       _impl->capture_session = _impl->frame_pool.CreateCaptureSession(_impl->item);
       _impl->frame_pool.FrameArrived({_impl.get(), &impl_t::on_frame_arrived});
 

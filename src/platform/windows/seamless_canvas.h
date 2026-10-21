@@ -66,6 +66,17 @@ namespace platf::seamless {
    *          because stage 3 rebuilds the canvas; stage 7 makes that list the
    *          dirty subset only.
    */
+  /**
+   * @brief Whether the capture path can carry the published canvas at all.
+   * @details The publisher must not send cells its texture cannot hold: a
+   *          fallback on one side only publishes desktop-measured cells against a
+   *          width-by-height texture. When this is false the publisher sends one
+   *          empty table (canvas unchanged, zero entries) and stops, so the wire
+   *          and the texture agree by absence.
+   */
+  bool compose_available();
+  void set_compose_available(bool available);
+
   /// The standard reflected CRC32 the protocol uses, as a running state so a
   /// rectangle can be hashed row by row (the mapped pitch is not the cell width).
   std::uint32_t crc32_begin();
