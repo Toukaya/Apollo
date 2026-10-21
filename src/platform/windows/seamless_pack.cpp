@@ -56,6 +56,12 @@ namespace platf::seamless {
       if (window.w == 0 || window.h == 0) {
         continue;
       }
+      // A window that can never fit the protocol maximum leaves the table; the
+      // others are still placed. One such window must not cost the session its
+      // whole table.
+      if (window.w > CANVAS_MAX || window.h > CANVAS_MAX) {
+        continue;
+      }
       total_area += (std::uint64_t) window.w * window.h;
       widest = std::max<std::uint32_t>(widest, window.w);
       placeable.push_back(window);

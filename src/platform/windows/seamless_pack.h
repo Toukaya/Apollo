@@ -29,7 +29,6 @@ namespace platf::seamless {
     std::uint16_t client_w = 0;
     std::uint16_t client_h = 0;
     std::uint8_t z = 0;
-    bool whole_window = false;  ///< the window is at or above the degrade edge
   };
 
   /// Whether a plan is a whole table or an incremental one.
