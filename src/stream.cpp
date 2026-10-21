@@ -744,11 +744,10 @@ namespace stream {
           if (bytes[2] == 5) {
             HWND target = nullptr;
             int matches = 0;
-            for (const auto &rec : session->seamless_table.inflight) {
-              if ((rec.id & 0xFFu) == bytes[1]) {
-                target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(rec.id));
-                matches++;
-              }
+            if (bytes[1] < session->seamless_table.published.size()) {
+              target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(
+                session->seamless_table.published[bytes[1]].id));
+              matches = 1;
             }
             if (target != nullptr && matches == 1) {
               SendNotifyMessageW(target, WM_CLOSE, 0, 0);
@@ -772,14 +771,16 @@ namespace stream {
           // holds. The wire's id field is one byte while an entry id is four, so
           // the match is on the low byte and an ambiguous one is refused rather
           // than guessed at.
+          // The byte is a WINDOW INDEX into the set the client holds: the table
+          // caps at 32 entries, so the index is unique and fits the field, and
+          // `published` (not `inflight`, which an ack clears) is that set.
           const auto wanted = bytes[1];
           HWND target = nullptr;
           int matches = 0;
-          for (const auto &rec : session->seamless_table.inflight) {
-            if ((rec.id & 0xFFu) == wanted) {
-              target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(rec.id));
-              matches++;
-            }
+          if (wanted < session->seamless_table.published.size()) {
+            target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(
+              session->seamless_table.published[wanted].id));
+            matches = 1;
           }
 
           if (target != nullptr && matches == 1) {
