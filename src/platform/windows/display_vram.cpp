@@ -1651,10 +1651,17 @@ namespace platf::dxgi {
       // The canvas is composed from the windows' own surfaces. The desktop is not
       // captured while the channel is open, and a pass with nothing new is a
       // timeout, so the existing skip path runs and no blank frame is encoded.
-      std::vector<platf::seamless::window_rec> windows;
-      if (!platf::seamless::snapshot(windows)) {
-        return capture_e::error;
+      const auto now = std::chrono::steady_clock::now();
+      if (seamless_windows.empty() ||
+          now - seamless_last_enum >= std::chrono::milliseconds(platf::seamless::POLL_INTERVAL_MS)) {
+        std::vector<platf::seamless::window_rec> refreshed;
+        if (!platf::seamless::snapshot(refreshed)) {
+          return capture_e::error;
+        }
+        seamless_windows = std::move(refreshed);
+        seamless_last_enum = now;
       }
+      const std::vector<platf::seamless::window_rec> &windows = seamless_windows;
 
       // One capture per published window; a window that left the table drops its
       // capture and the cell it owned.
@@ -1753,6 +1760,51 @@ namespace platf::dxgi {
         platf::seamless::compose_cells(device_ctx.get(), seamless_canvas_texture.get(), copies);
 
         device_ctx->CopyResource(d3d_img->capture_texture.get(), seamless_canvas_texture.get());
+
+        // QA's bit-correct line: the hash of exactly the pixels this cell holds,
+        // over the same rectangle the client will read back. Measurement only, so
+        // a normal session pays nothing.
+        if (seamless_compare) {
+          if (!seamless_staging) {
+            D3D11_TEXTURE2D_DESC staging_desc {};
+            staging_desc.Width = width;
+            staging_desc.Height = height;
+            staging_desc.MipLevels = 1;
+            staging_desc.ArraySize = 1;
+            staging_desc.SampleDesc.Count = 1;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, &seamless_staging))) {
+              BOOST_LOG(warning) << "Seamless: cannot create the compare staging texture"sv;
+              seamless_compare = false;
+            }
+          }
+
+          if (seamless_compare) {
+            device_ctx->CopyResource(seamless_staging.get(), seamless_canvas_texture.get());
+            D3D11_MAPPED_SUBRESOURCE mapped {};
+            if (SUCCEEDED(device_ctx->Map(seamless_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+              const auto *bytes = static_cast<const std::uint8_t *>(mapped.pData);
+              for (const auto &cell : plan.cells) {
+                // Row by row, on one running state: the mapped pitch is not the
+                // cell width, and combining per-row hashes would not be the same
+                // hash as the contiguous rectangle.
+                std::uint32_t state = platf::seamless::crc32_begin();
+                for (std::uint16_t row = 0; row < cell.h; row++) {
+                  const std::uint8_t *line = bytes + (size_t) (cell.y + row) * mapped.RowPitch + (size_t) cell.x * 4;
+                  state = platf::seamless::crc32_update(state, line, (size_t) cell.w * 4);
+                }
+                const std::uint32_t crc = platf::seamless::crc32_finish(state);
+                BOOST_LOG(info) << "Seamless: compare frame="sv << seamless_compare_frame << " window="sv << cell.id
+                                << " cell="sv << cell.x << ',' << cell.y << ',' << cell.w << 'x' << cell.h
+                                << " hostcrc="sv << util::hex(crc).to_string_view();
+              }
+              device_ctx->Unmap(seamless_staging.get(), 0);
+              seamless_compare_frame++;
+            }
+          }
+        }
       }
 
       seamless_composed = windows;
@@ -1822,10 +1874,32 @@ namespace platf::dxgi {
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
     seamless_enabled = config.seamless;
     seamless_framerate = config.framerate;
-    seamless_canvas.x = 0;
-    seamless_canvas.y = 0;
-    seamless_canvas.w = static_cast<std::uint16_t>(width);
-    seamless_canvas.h = static_cast<std::uint16_t>(height);
+    if (seamless_enabled) {
+      // The canvas must come from the same source the table publishes, or the
+      // cells the client samples are measured against a different rectangle than
+      // the texture they are read from.
+      seamless_canvas = platf::seamless::virtual_canvas();
+      if (seamless_canvas.w == 0 || seamless_canvas.h == 0) {
+        BOOST_LOG(warning) << "Seamless: the virtual desktop has no size, the channel falls back to the desktop composite"sv;
+        seamless_enabled = false;
+      }
+      else if (seamless_canvas.x != 0 || seamless_canvas.y != 0 ||
+               static_cast<int>(seamless_canvas.w) != width || static_cast<int>(seamless_canvas.h) != height) {
+        // The encoder input is this display's image, so the composite can only be
+        // carried when the two rectangles agree. Multi-monitor desktops and
+        // scaled stream sizes do not, and a desktop composite is correct only for
+        // a single foreground window - so this is a named fallback, not silence.
+        BOOST_LOG(warning) << "Seamless: the virtual desktop "sv << seamless_canvas.x << ',' << seamless_canvas.y
+                           << ' ' << seamless_canvas.w << 'x' << seamless_canvas.h
+                           << " is not this display "sv << width << 'x' << height
+                           << "; the channel falls back to the desktop composite, correct only for a single foreground window"sv;
+        seamless_enabled = false;
+      }
+    }
+    {
+      const char *compare = std::getenv("SUNSHINE_SEAMLESS_COMPARE");
+      seamless_compare = compare != nullptr && compare[0] != '0';
+    }
     if (seamless_enabled && capture_format != DXGI_FORMAT_B8G8R8A8_UNORM) {
       // The cells are copied with CopySubresourceRegion, which cannot convert a
       // format; an HDR canvas would need a draw. Stage 3 keeps the desktop path.

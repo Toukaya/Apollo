@@ -395,6 +395,12 @@ namespace platf::dxgi {
     std::vector<platf::seamless::window_rec> seamless_composed;
     texture2d_t seamless_canvas_texture;
     bool seamless_hdr_unsupported = false;
+    // The bit-correct instrument: measurement only, off unless asked for.
+    bool seamless_compare = false;
+    std::vector<platf::seamless::window_rec> seamless_windows;
+    std::chrono::steady_clock::time_point seamless_last_enum {};
+    std::uint32_t seamless_compare_frame = 0;
+    texture2d_t seamless_staging;
 
   public:
     int init(const ::video::config_t &config, const std::string &display_name);

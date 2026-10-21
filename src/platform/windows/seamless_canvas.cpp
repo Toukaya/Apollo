@@ -37,6 +37,28 @@ namespace platf::seamless {
     }
   }  // namespace
 
+  std::uint32_t crc32_begin() {
+    return 0xFFFFFFFFu;
+  }
+
+  std::uint32_t crc32_update(std::uint32_t state, const std::uint8_t *data, std::size_t length) {
+    for (std::size_t i = 0; i < length; i++) {
+      state ^= data[i];
+      for (int bit = 0; bit < 8; bit++) {
+        state = (state & 1u) ? ((state >> 1) ^ 0xEDB88320u) : (state >> 1);
+      }
+    }
+    return state;
+  }
+
+  std::uint32_t crc32_finish(std::uint32_t state) {
+    return state ^ 0xFFFFFFFFu;
+  }
+
+  std::uint32_t crc32_of(const std::uint8_t *data, std::size_t length) {
+    return crc32_finish(crc32_update(crc32_begin(), data, length));
+  }
+
   void compose_cells(ID3D11DeviceContext *context, ID3D11Texture2D *canvas,
                      const std::vector<canvas_copy> &copies) {
     if (context == nullptr || canvas == nullptr) {

@@ -66,6 +66,15 @@ namespace platf::seamless {
    *          because stage 3 rebuilds the canvas; stage 7 makes that list the
    *          dirty subset only.
    */
+  /// The standard reflected CRC32 the protocol uses, as a running state so a
+  /// rectangle can be hashed row by row (the mapped pitch is not the cell width).
+  std::uint32_t crc32_begin();
+  std::uint32_t crc32_update(std::uint32_t state, const std::uint8_t *data, std::size_t length);
+  std::uint32_t crc32_finish(std::uint32_t state);
+
+  /// One buffer in one call, for the offline self test.
+  std::uint32_t crc32_of(const std::uint8_t *data, std::size_t length);
+
   /// One window's surface and the cell it belongs in.
   struct canvas_copy {
     ID3D11Texture2D *source = nullptr;
@@ -75,8 +84,9 @@ namespace platf::seamless {
   /**
    * @brief Copy every window's own surface into its cell.
    * @details Pure copies: the cell is the window's size (cellW == clientW), so
-   *          nothing here scales. The canvas is cleared by the caller when its
-   *          previous content must not show through.
+   *          nothing here scales. Stage 3 copies every cell on every pass, so the
+   *          canvas is fully covered and no clearing is needed; stage 7, which
+   *          copies only dirty cells, must clear the cells it does not touch.
    */
   void compose_cells(ID3D11DeviceContext *context, ID3D11Texture2D *canvas,
                      const std::vector<canvas_copy> &copies);
