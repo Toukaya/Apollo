@@ -516,8 +516,16 @@ namespace platf::seamless {
       return capture_e::timeout;
     }
 
-    auto access = _impl->consumed_frame.Surface().as<winrt::IDirect3DDxgiInterfaceAccess>();
-    if (access == nullptr || FAILED(access->GetInterface(IID_ID3D11Texture2D, (void **) out)) || *out == nullptr) {
+    // This runs on the capture thread: a winrt error escaping here would take the
+    // process down, so the extraction is guarded like the frame arrival is.
+    try {
+      auto access = _impl->consumed_frame.Surface().as<winrt::IDirect3DDxgiInterfaceAccess>();
+      if (access == nullptr || FAILED(access->GetInterface(IID_ID3D11Texture2D, (void **) out)) || *out == nullptr) {
+        return capture_e::error;
+      }
+    }
+    catch (winrt::hresult_error &e) {
+      BOOST_LOG(warning) << "Seamless: window frame extraction failed: 0x"sv << util::hex(e.code()).to_string_view();
       return capture_e::error;
     }
 
