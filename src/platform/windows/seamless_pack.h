@@ -41,22 +41,41 @@ namespace platf::seamless {
 
   struct pack_plan {
     bool ok = false;             ///< false when nothing could be placed
+    // The canvas the plan computed: the smallest 16-pixel-multiple box that holds
+    // the packed area, clamped to the protocol maximum. It is an OUTPUT, not the
+    // input rectangle, because the encoded frame must cost what the windows cost.
     std::uint16_t canvas_w = 0;
     std::uint16_t canvas_h = 0;
     std::vector<pack_cell> cells;  ///< area-descending, ties by id ascending
-    bool degrade = false;          ///< some cell is in whole-window mode
+    // The whole-plan degrade judgement (reference X2): the total packed area is
+    // above 60 percent of the client screen area. The CALLER acts on it; the
+    // packer only reports it.
+    bool degrade = false;
     pack_kind kind = pack_kind::snapshot;
     double utilization = 0.0;      ///< sum of cell areas over canvas area
   };
 
-  /// The degrade edge, as a fraction of the canvas area (60 percent).
+  /// The degrade edge, as a fraction of the CLIENT SCREEN area (60 percent).
   constexpr double DEGRADE_AREA_FRACTION = 0.60;
+
+  /// The canvas is expressed in 16-pixel multiples.
+  constexpr std::uint16_t CANVAS_ALIGNMENT = 16;
+
+  /// The protocol's canvas maximum, both axes.
+  constexpr std::uint16_t CANVAS_MAX = 4096;
+
+  /// Cells are allocated at the window's own size, so the client's sampler is
+  /// what scales a cell down to a local window. That is the pixel-budget
+  /// decision of this stage: the budget becomes real here, with window-sized
+  /// cells and a canvas computed from them, not with shrunken cells.
 
   /**
    * @brief Pack the windows into the canvas.
-   * @param canvas the canvas rectangle the cells are measured from.
+   * @param limit the protocol maximum the computed canvas must stay inside.
    * @param windows the window set, in any order.
    * @param previous the plan last sent, or nullptr for a first plan.
+   * @param client_screen_area the client's screen area, the reference the
+   *        reference's X2 degrade rule is judged against.
    * @return the plan; `kind` is a snapshot whenever the canvas or the membership
    *         differs from `previous`, because only a snapshot carries both.
    * @details Windows are placed in non-increasing area order, ties by id, on a
@@ -65,6 +84,6 @@ namespace platf::seamless {
    *          sorted sizes and ids only, never on the windows' desktop positions,
    *          so moving one window cannot re-layout the others.
    */
-  pack_plan pack_windows(const canvas_rect &canvas, const std::vector<window_rec> &windows,
-                         const pack_plan *previous);
+  pack_plan pack_windows(const canvas_rect &limit, const std::vector<window_rec> &windows,
+                         const pack_plan *previous, double client_screen_area);
 }  // namespace platf::seamless

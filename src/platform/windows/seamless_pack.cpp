@@ -41,76 +41,112 @@ namespace platf::seamless {
     }
   }  // namespace
 
-  pack_plan pack_windows(const canvas_rect &canvas, const std::vector<window_rec> &windows,
-                         const pack_plan *previous) {
+  pack_plan pack_windows(const canvas_rect &limit, const std::vector<window_rec> &windows,
+                         const pack_plan *previous, double client_screen_area) {
     pack_plan plan;
-    plan.canvas_w = canvas.w;
-    plan.canvas_h = canvas.h;
-
-    if (canvas.w == 0 || canvas.h == 0) {
-      return plan;
-    }
 
     std::vector<window_rec> order = windows;
     std::sort(order.begin(), order.end(), place_before);
 
-    const double canvas_area = (double) canvas.w * (double) canvas.h;
-
-    // Shelf packing: one row at a time, the row's height is its tallest cell.
-    std::uint32_t shelf_x = 0;
-    std::uint32_t shelf_y = 0;
-    std::uint32_t shelf_h = 0;
-
+    // Drop what can never be placed, and measure what has to fit.
+    std::uint64_t total_area = 0;
+    std::uint32_t widest = 0;
+    std::vector<window_rec> placeable;
     for (const auto &window : order) {
-      if (window.w == 0 || window.h == 0 || window.w > canvas.w || window.h > canvas.h) {
-        // A window that cannot fit the canvas at all is not placeable; the caller
-        // sees it missing from the cell list.
+      if (window.w == 0 || window.h == 0) {
         continue;
       }
-
-      if (shelf_x + window.w > canvas.w) {
-        shelf_x = 0;
-        shelf_y += shelf_h;
-        shelf_h = 0;
-      }
-      if (shelf_y + window.h > canvas.h) {
-        continue;
-      }
-
-      pack_cell cell;
-      cell.id = window.id;
-      cell.x = (std::uint16_t) shelf_x;
-      cell.y = (std::uint16_t) shelf_y;
-      cell.w = window.w;
-      cell.h = window.h;
-      cell.client_w = window.w;
-      cell.client_h = window.h;
-      cell.z = window.z;
-      cell.whole_window = ((double) window.w * window.h) >= DEGRADE_AREA_FRACTION * canvas_area;
-      if (cell.whole_window) {
-        plan.degrade = true;
-      }
-      plan.cells.push_back(cell);
-
-      shelf_x += window.w;
-      shelf_h = std::max<std::uint32_t>(shelf_h, window.h);
+      total_area += (std::uint64_t) window.w * window.h;
+      widest = std::max<std::uint32_t>(widest, window.w);
+      placeable.push_back(window);
+    }
+    if (placeable.empty()) {
+      return plan;
     }
 
-    if (plan.cells.empty()) {
+    // The smallest 16-pixel-multiple box that actually holds the shelf packing:
+    // for every candidate width, simulate the packing and keep the box with the
+    // smallest area. The canvas is what the windows cost, not the desktop rect.
+    const std::uint32_t limit_w = std::min<std::uint32_t>(limit.w ? limit.w : CANVAS_MAX, CANVAS_MAX);
+    const std::uint32_t limit_h = std::min<std::uint32_t>(limit.h ? limit.h : CANVAS_MAX, CANVAS_MAX);
+
+    std::uint32_t best_w = 0;
+    std::uint32_t best_h = 0;
+    std::vector<pack_cell> best_cells;
+
+    for (std::uint32_t candidate_w = (std::uint32_t) (CANVAS_ALIGNMENT *
+                                                       ((widest + CANVAS_ALIGNMENT - 1) / CANVAS_ALIGNMENT));
+         candidate_w <= limit_w; candidate_w += CANVAS_ALIGNMENT) {
+      std::vector<pack_cell> cells;
+      std::uint32_t shelf_x = 0;
+      std::uint32_t shelf_y = 0;
+      std::uint32_t shelf_h = 0;
+      bool fits = true;
+
+      for (const auto &window : placeable) {
+        if (window.w > candidate_w) {
+          fits = false;
+          break;
+        }
+        if (shelf_x + window.w > candidate_w) {
+          shelf_x = 0;
+          shelf_y += shelf_h;
+          shelf_h = 0;
+        }
+        if (shelf_y + window.h > limit_h) {
+          fits = false;
+          break;
+        }
+
+        pack_cell cell;
+        cell.id = window.id;
+        cell.x = (std::uint16_t) shelf_x;
+        cell.y = (std::uint16_t) shelf_y;
+        cell.w = window.w;
+        cell.h = window.h;
+        cell.client_w = window.w;
+        cell.client_h = window.h;
+        cell.z = window.z;
+        cells.push_back(cell);
+
+        shelf_x += window.w;
+        shelf_h = std::max<std::uint32_t>(shelf_h, window.h);
+      }
+
+      if (!fits) {
+        continue;
+      }
+
+      const std::uint32_t needed_h = (std::uint32_t) (CANVAS_ALIGNMENT *
+                                                      ((shelf_y + shelf_h + CANVAS_ALIGNMENT - 1) / CANVAS_ALIGNMENT));
+      const std::uint64_t area = (std::uint64_t) candidate_w * needed_h;
+      if (best_w == 0 || area < (std::uint64_t) best_w * best_h) {
+        best_w = candidate_w;
+        best_h = needed_h;
+        best_cells = std::move(cells);
+      }
+    }
+
+    if (best_w == 0) {
       return plan;
     }
 
     plan.ok = true;
+    plan.canvas_w = (std::uint16_t) best_w;
+    plan.canvas_h = (std::uint16_t) best_h;
+    plan.cells = std::move(best_cells);
 
     double used = 0;
     for (const auto &cell : plan.cells) {
       used += (double) cell.w * cell.h;
     }
-    plan.utilization = used / canvas_area;
+    plan.utilization = used / ((double) plan.canvas_w * (double) plan.canvas_h);
 
-    // A snapshot is the only table that carries the canvas and the cells
-    // together, so a canvas or membership change must be one; a plan that only
-    // moves a cell inside the same canvas may be a delta.
+    // X2: the whole-plan degrade, total packed area against the CLIENT SCREEN
+    // area, reported here and acted on by the caller - never per window and never
+    // against the canvas.
+    plan.degrade = client_screen_area > 0 && used > DEGRADE_AREA_FRACTION * client_screen_area;
+
     if (previous == nullptr || !previous->ok || previous->canvas_w != plan.canvas_w ||
         previous->canvas_h != plan.canvas_h || !same_membership(previous->cells, order)) {
       plan.kind = pack_kind::snapshot;
