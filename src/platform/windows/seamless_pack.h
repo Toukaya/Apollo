@@ -11,6 +11,7 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -76,6 +77,10 @@ namespace platf::seamless {
     std::uint32_t height_overflow = 0; ///< a row did not fit the canvas height
     std::uint32_t too_wide = 0;        ///< a window was wider than the candidate
     std::uint32_t refused = 0;         ///< windows the accepted plan does not hold
+    // The first few candidate attempts of the last call: width, the height the
+    // packing would need, and whether it fit. This is the dump that names an
+    // early give-up instead of guessing at it.
+    std::vector<std::array<std::uint32_t, 3>> attempts;
   };
 
   const packer_stats &last_packer_stats();

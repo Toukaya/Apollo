@@ -131,11 +131,17 @@ namespace platf::seamless {
       }
 
       if (!fits) {
+        if (g_stats.attempts.size() < 16) {
+          g_stats.attempts.push_back({candidate_w, shelf_y + shelf_h, 0u});
+        }
         continue;
       }
 
       const std::uint32_t needed_h = (std::uint32_t) (CANVAS_ALIGNMENT *
                                                       ((shelf_y + shelf_h + CANVAS_ALIGNMENT - 1) / CANVAS_ALIGNMENT));
+      if (g_stats.attempts.size() < 16) {
+        g_stats.attempts.push_back({candidate_w, needed_h, fits ? 1u : 0u});
+      }
       const std::uint64_t area = (std::uint64_t) candidate_w * needed_h;
       if (best_w == 0 || area < (std::uint64_t) best_w * best_h) {
         best_w = candidate_w;
