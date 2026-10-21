@@ -5,14 +5,17 @@
  */
 // standard includes
 #include <algorithm>
-#include <atomic>
 
 // local includes
 #include "seamless_canvas.h"
 
 namespace platf::seamless {
   namespace {
-    std::atomic<bool> compose_ok {true};
+    // Written once by the capture side when a session starts, read by the
+    // publisher afterwards. A plain bool is enough for a one-way init-time flag
+    // and keeps this translation unit free of the atomic header, which drags in
+    // a pthread chain this harness cannot compile.
+    bool compose_ok = true;
   }
 
   namespace {
@@ -43,11 +46,11 @@ namespace platf::seamless {
   }  // namespace
 
   bool compose_available() {
-    return compose_ok.load(std::memory_order_relaxed);
+    return compose_ok;
   }
 
   void set_compose_available(bool available) {
-    compose_ok.store(available, std::memory_order_relaxed);
+    compose_ok = available;
   }
 
   std::uint32_t crc32_begin() {
