@@ -68,6 +68,18 @@ namespace platf::seamless {
   /// decision of this stage: the budget becomes real here, with window-sized
   /// cells and a canvas computed from them, not with shrunken cells.
 
+  /// Counters for one pack_windows call: where a candidate gave up, so an early
+  /// give-up can be named from numbers instead of guessed.
+  struct packer_stats {
+    std::uint32_t candidates = 0;      ///< canvas widths tried
+    std::uint32_t row_overflow = 0;    ///< a window did not fit the current row
+    std::uint32_t height_overflow = 0; ///< a row did not fit the canvas height
+    std::uint32_t too_wide = 0;        ///< a window was wider than the candidate
+    std::uint32_t refused = 0;         ///< windows the accepted plan does not hold
+  };
+
+  const packer_stats &last_packer_stats();
+
   /**
    * @brief Pack the windows into the canvas.
    * @param limit the protocol maximum the computed canvas must stay inside.

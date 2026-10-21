@@ -11,6 +11,14 @@
 
 namespace platf::seamless {
   namespace {
+    packer_stats g_stats;
+  }
+
+  const packer_stats &last_packer_stats() {
+    return g_stats;
+  }
+
+  namespace {
     /// The order windows are placed in: larger area first, ties by id.
     bool place_before(const window_rec &a, const window_rec &b) {
       const std::uint32_t area_a = (std::uint32_t) a.w * a.h;
@@ -74,6 +82,7 @@ namespace platf::seamless {
     const std::uint32_t limit_w = std::min<std::uint32_t>(limit.w ? limit.w : CANVAS_MAX, CANVAS_MAX);
     const std::uint32_t limit_h = std::min<std::uint32_t>(limit.h ? limit.h : CANVAS_MAX, CANVAS_MAX);
 
+    g_stats = packer_stats {};
     std::uint32_t best_w = 0;
     std::uint32_t best_h = 0;
     std::vector<pack_cell> best_cells;
@@ -81,6 +90,7 @@ namespace platf::seamless {
     for (std::uint32_t candidate_w = (std::uint32_t) (CANVAS_ALIGNMENT *
                                                        ((widest + CANVAS_ALIGNMENT - 1) / CANVAS_ALIGNMENT));
          candidate_w <= limit_w; candidate_w += CANVAS_ALIGNMENT) {
+      g_stats.candidates++;
       std::vector<pack_cell> cells;
       std::uint32_t shelf_x = 0;
       std::uint32_t shelf_y = 0;
@@ -89,15 +99,18 @@ namespace platf::seamless {
 
       for (const auto &window : placeable) {
         if (window.w > candidate_w) {
+          g_stats.too_wide++;
           fits = false;
           break;
         }
         if (shelf_x + window.w > candidate_w) {
+          g_stats.row_overflow++;
           shelf_x = 0;
           shelf_y += shelf_h;
           shelf_h = 0;
         }
         if (shelf_y + window.h > limit_h) {
+          g_stats.height_overflow++;
           fits = false;
           break;
         }
@@ -136,6 +149,7 @@ namespace platf::seamless {
     }
 
     plan.ok = true;
+    g_stats.refused = (std::uint32_t) (placeable.size() > best_cells.size() ? placeable.size() - best_cells.size() : 0);
     plan.canvas_w = (std::uint16_t) best_w;
     plan.canvas_h = (std::uint16_t) best_h;
     plan.cells = std::move(best_cells);
