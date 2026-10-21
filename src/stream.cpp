@@ -744,8 +744,36 @@ namespace stream {
             BOOST_LOG(warning) << "Seamless: input message of "sv << length << " bytes dropped"sv;
             return;
           }
-          BOOST_LOG(verbose) << "Seamless: input window="sv << (int) bytes[1]
-                             << " mode="sv << (int) bytes[2] << " pid="sv << rd32(bytes + 3);
+
+          // Apply the focus the client asked for, on a window the scoped table
+          // holds. The wire's id field is one byte while an entry id is four, so
+          // the match is on the low byte and an ambiguous one is refused rather
+          // than guessed at.
+          const auto wanted = bytes[1];
+          HWND target = nullptr;
+          int matches = 0;
+          for (const auto &rec : session->seamless_table.inflight) {
+            if ((rec.id & 0xFFu) == wanted) {
+              target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(rec.id));
+              matches++;
+            }
+          }
+
+          if (target != nullptr && matches == 1) {
+            const auto rec_target_for_log = [](HWND h) { return reinterpret_cast<std::uintptr_t>(h); };
+            if (bytes[2] == SEAMLESS_INPUT_FOCUS_RAISE) {
+              BringWindowToTop(target);
+            }
+            if (GetForegroundWindow() != target) {
+              SetForegroundWindow(target);
+            }
+            BOOST_LOG(verbose) << "Seamless: input window="sv << (int) wanted << " mode="sv << (int) bytes[2]
+                               << " applied to 0x"sv << util::hex(rec_target_for_log(target)).to_string_view();
+          }
+          else {
+            BOOST_LOG(warning) << "Seamless: input for window="sv << (int) wanted
+                               << " matched "sv << matches << " windows, dropped"sv;
+          }
           break;
         }
 
