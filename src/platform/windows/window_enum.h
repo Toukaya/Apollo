@@ -54,9 +54,10 @@ namespace platf::seamless {
    *          no-activate window, not this process, with a non-empty extended
    *          frame bounds from the desktop compositor. Geometry never comes from
    *          the legacy window rectangle, because that rectangle includes the
-   *          invisible resize border.
+   *          invisible resize border. When only_pid is non-zero the set is scoped
+   *          to that process: the app the user launched, and its own windows.
    */
-  bool snapshot(std::vector<window_rec> &out);
+  bool snapshot(std::vector<window_rec> &out, std::uint32_t only_pid = 0);
 
   /**
    * @brief Install the change hooks and the fallback poll.

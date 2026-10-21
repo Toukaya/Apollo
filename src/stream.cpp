@@ -758,7 +758,14 @@ namespace stream {
           // applies to the version that was sent, which the table state kept,
           // so this handler never reads the window set again: a window that
           // changed while the version was in flight must still be sent.
-          platf::seamless::apply_ack(session->seamless_table, bytes[1], bytes[2]);
+          {
+            const bool matched = platf::seamless::apply_ack(session->seamless_table, bytes[1], bytes[2]);
+            // The host half of the end-to-end ack line: what arrived and whether
+            // the sequence moved because of it.
+            BOOST_LOG(info) << "Seamless: ack received seq="sv << (int) bytes[1] << " result="sv << (int) bytes[2]
+                            << " matched="sv << (matched ? 1 : 0) << " seq_now="sv
+                            << (int) session->seamless_table.seq;
+          }
           break;
         }
 
@@ -868,7 +875,10 @@ namespace stream {
       session->seamless_last_poll_ms = now_ms;
 
       std::vector<platf::seamless::window_rec> windows;
-      if (!platf::seamless::snapshot(windows)) {
+      // The table is scoped to the app this host launched: a user picking one app
+      // gets that app's windows, not every window on the desktop. The compose
+      // asks the same question with the same pid.
+      if (!platf::seamless::snapshot(windows, proc::proc.pid())) {
         BOOST_LOG(warning) << "Seamless: window enumeration failed"sv;
         return;
       }

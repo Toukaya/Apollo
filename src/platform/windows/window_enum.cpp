@@ -19,6 +19,14 @@ using namespace std::literals;
 
 namespace platf::seamless {
   namespace {
+    /// What the enumeration callback needs: the output, this process, and the
+    /// optional app the table is scoped to.
+    struct collect_ctx_t {
+      std::vector<window_rec> *out;
+      DWORD own_pid;
+      std::uint32_t only_pid;
+    };
+
     /// The title is truncated to the protocol limit, in bytes, before hashing.
     constexpr std::size_t TITLE_LIMIT = SEAMLESS_MAX_TITLE;
 
@@ -79,10 +87,10 @@ namespace platf::seamless {
      *          says 0 is the bottom.
      */
     BOOL CALLBACK collect_proc(HWND hwnd, LPARAM param) {
-      auto *ctx = reinterpret_cast<std::pair<std::vector<window_rec> *, DWORD> *>(param);
+      auto *ctx = reinterpret_cast<collect_ctx_t *>(param);
 
       RECT bounds {};
-      if (!is_candidate(hwnd, ctx->second, bounds)) {
+      if (!is_candidate(hwnd, ctx->own_pid, bounds)) {
         return TRUE;
       }
 
@@ -90,6 +98,13 @@ namespace platf::seamless {
       rec.id = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(hwnd));
       DWORD pid = 0;
       GetWindowThreadProcessId(hwnd, &pid);
+
+      // Scoped to the launched app when the caller asks for it: a user picking
+      // one app gets that app's windows (and its own children), nothing else.
+      if (ctx->only_pid != 0 && pid != ctx->only_pid) {
+        return TRUE;
+      }
+
       rec.pid = static_cast<std::uint32_t>(pid);
       rec.x = static_cast<std::int16_t>(bounds.left);
       rec.y = static_cast<std::int16_t>(bounds.top);
@@ -110,7 +125,7 @@ namespace platf::seamless {
       rec.flags |= SEAMLESS_WF_VISIBLE;
       rec.flags |= SEAMLESS_WF_CAPTURABLE;
 
-      ctx->first->push_back(std::move(rec));
+      ctx->out->push_back(std::move(rec));
       return TRUE;
     }
 
@@ -174,11 +189,11 @@ namespace platf::seamless {
     return hash;
   }
 
-  bool snapshot(std::vector<window_rec> &out) {
+  bool snapshot(std::vector<window_rec> &out, std::uint32_t only_pid) {
     out.clear();
 
     const auto own_pid = GetCurrentProcessId();
-    std::pair<std::vector<window_rec> *, DWORD> ctx {&out, own_pid};
+    collect_ctx_t ctx {&out, own_pid, only_pid};
 
     if (!EnumWindows(collect_proc, reinterpret_cast<LPARAM>(&ctx))) {
       out.clear();

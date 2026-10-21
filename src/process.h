@@ -111,6 +111,13 @@ namespace proc {
     bool virtual_display = false;
     bool allow_client_commands = false;
 
+    /// The pid of the process this host launched, or 0 when nothing is running.
+    /// The seamless window table is scoped to it: a user picking one app gets
+    /// that app's windows, not every window on the desktop.
+    std::uint32_t pid() const {
+      return _process.valid() ? static_cast<std::uint32_t>(_process.id()) : 0;
+    }
+
     proc_t(
       boost::process::v1::environment &&env,
       std::vector<ctx_t> &&apps

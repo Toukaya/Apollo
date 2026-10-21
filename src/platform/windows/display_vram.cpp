@@ -20,6 +20,7 @@ extern "C" {
 
 // local includes
 #include "display.h"
+#include "process.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
@@ -1655,7 +1656,8 @@ namespace platf::dxgi {
       if (seamless_windows.empty() ||
           now - seamless_last_enum >= std::chrono::milliseconds(platf::seamless::POLL_INTERVAL_MS)) {
         std::vector<platf::seamless::window_rec> refreshed;
-        if (!platf::seamless::snapshot(refreshed)) {
+        // One scope, shared with the publisher: the launched app's process.
+        if (!platf::seamless::snapshot(refreshed, proc::proc.pid())) {
           return capture_e::error;
         }
         seamless_windows = std::move(refreshed);
