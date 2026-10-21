@@ -1011,6 +1011,11 @@ namespace stream {
         std::vector<std::uint8_t> pixels;
         if (!platf::seamless::icon_bytes(rec.icon_hash, pixels) ||
             pixels.size() > SEAMLESS_MAX_ICON) {
+          // Never silent: an over-cap icon would otherwise read as a blank tile
+          // with no error on a live session.
+          BOOST_LOG(warning) << "Seamless: icon 0x"sv << util::hex(rec.icon_hash).to_string_view()
+                             << " skipped, "sv << pixels.size() << " bytes over the "sv
+                             << SEAMLESS_MAX_ICON << " cap"sv;
           continue;
         }
         std::vector<std::uint8_t> icon(SEAMLESS_ICON_HEADER_SIZE + pixels.size());
