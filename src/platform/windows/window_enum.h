@@ -29,7 +29,14 @@ namespace platf::seamless {
     std::uint8_t flags = 0;  ///< SEAMLESS_WF_* and the window state bits
     std::wstring title;
     std::uint32_t title_hash = 0;
+    std::uint32_t icon_hash = 0;  ///< hash of the 32x32 BGRA icon, 0 when none
   };
+
+  /// The 32x32 BGRA bytes of an icon, when the host has one for that hash.
+  bool icon_bytes(std::uint32_t icon_hash, std::vector<std::uint8_t> &out);
+
+  /// The icon edge the uplink sends: 32 pixels, 4096 bytes of BGRA.
+  constexpr std::uint16_t ICON_SIZE = 32;
 
   /**
    * @brief The window state bits of the flags byte.

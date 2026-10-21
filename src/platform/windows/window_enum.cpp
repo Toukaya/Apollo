@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <map>
 #include <cstring>
 
 // platform includes
@@ -19,6 +20,76 @@ using namespace std::literals;
 
 namespace platf::seamless {
   namespace {
+    std::map<std::uint32_t, std::vector<std::uint8_t>> g_icons;
+
+    /// FNV-1a over the icon bytes: the wire carries this hash, never the pixels.
+    std::uint32_t hash_bytes(const std::uint8_t *data, std::size_t length) {
+      std::uint32_t hash = 2166136261u;
+      for (std::size_t i = 0; i < length; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+      }
+      return hash;
+    }
+
+    /**
+     * @brief Draw one window icon into a 32 by 32 BGRA buffer.
+     * @details The compositor hands out HICONs in two shapes: 32-bit with alpha,
+     *          and 1-bit masked. DrawIconEx fills a 32-bit DIB for both; the
+     *          masked ones come back with every alpha byte at zero, so the alpha
+     *          pass below reconstructs it from the colour (a transparent pixel in a
+     *          masked icon is black with the mask bit set).
+     */
+    bool extract_icon(HICON icon, std::vector<std::uint8_t> &out) {
+      if (icon == nullptr) {
+        return false;
+      }
+
+      BITMAPINFO info {};
+      info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+      info.bmiHeader.biWidth = ICON_SIZE;
+      info.bmiHeader.biHeight = -ICON_SIZE;  // top down
+      info.bmiHeader.biPlanes = 1;
+      info.bmiHeader.biBitCount = 32;
+      info.bmiHeader.biCompression = BI_RGB;
+
+      HDC dc = CreateCompatibleDC(nullptr);
+      if (dc == nullptr) {
+        return false;
+      }
+
+      void *bits = nullptr;
+      HBITMAP dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+      if (dib == nullptr || bits == nullptr) {
+        DeleteDC(dc);
+        return false;
+      }
+
+      HGDIOBJ previous = SelectObject(dc, dib);
+      DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, nullptr, DI_NORMAL);
+      SelectObject(dc, previous);
+
+      out.assign(static_cast<std::uint8_t *>(bits), static_cast<std::uint8_t *>(bits) + ICON_SIZE * ICON_SIZE * 4);
+
+      bool anyAlpha = false;
+      for (std::size_t i = 3; i < out.size(); i += 4) {
+        if (out[i] != 0) {
+          anyAlpha = true;
+          break;
+        }
+      }
+      if (!anyAlpha) {
+        for (std::size_t i = 0; i < out.size(); i += 4) {
+          const bool transparent = out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 0;
+          out[i + 3] = transparent ? 0 : 255;
+        }
+      }
+
+      DeleteObject(dib);
+      DeleteDC(dc);
+      return true;
+    }
+
     /// What the enumeration callback needs: the output, this process, and the
     /// optional app the table is scoped to.
     struct collect_ctx_t {
@@ -122,6 +193,24 @@ namespace platf::seamless {
       const auto ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
       rec.flags |= state_bits(IsIconic(hwnd) != 0, IsZoomed(hwnd) != 0,
                               (ex_style & WS_EX_TOPMOST) != 0);
+
+      // The icon: WM_GETICON first, then the class icon. Only the hash crosses the
+      // wire, and only once per hash.
+      HICON icon = reinterpret_cast<HICON>(SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0,
+                                                               SMTO_ABORTIFHUNG, 100, nullptr));
+      if (icon == nullptr) {
+        icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICONSM));
+      }
+      if (icon == nullptr) {
+        icon = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICON));
+      }
+
+      std::vector<std::uint8_t> iconPixels;
+      if (extract_icon(icon, iconPixels) && iconPixels.size() == ICON_SIZE * ICON_SIZE * 4) {
+        rec.icon_hash = hash_bytes(iconPixels.data(), iconPixels.size());
+        g_icons[rec.icon_hash] = std::move(iconPixels);
+        rec.flags |= SEAMLESS_WF_HAS_ICON;
+      }
       rec.flags |= SEAMLESS_WF_VISIBLE;
       rec.flags |= SEAMLESS_WF_CAPTURABLE;
 
@@ -187,6 +276,15 @@ namespace platf::seamless {
     }
 
     return hash;
+  }
+
+  bool icon_bytes(std::uint32_t icon_hash, std::vector<std::uint8_t> &out) {
+    const auto it = g_icons.find(icon_hash);
+    if (it == g_icons.end()) {
+      return false;
+    }
+    out = it->second;
+    return true;
   }
 
   bool snapshot(std::vector<window_rec> &out, std::uint32_t only_pid) {

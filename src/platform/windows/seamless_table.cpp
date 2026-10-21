@@ -83,6 +83,7 @@ namespace platf::seamless {
     out.z = rec.z;
     out.flags = rec.flags;
     out.titleHash = rec.title_hash;
+    out.iconHash = rec.icon_hash;
     out.cellX = static_cast<std::uint16_t>(cell_x);
     out.cellY = static_cast<std::uint16_t>(cell_y);
     out.cellW = rec.w;

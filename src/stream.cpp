@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <future>
@@ -933,6 +934,51 @@ namespace stream {
         session->seamless_table.inflight.clear();
         BOOST_LOG(warning) << "Seamless: table send failed: "sv << sent;
         return;
+      }
+
+      // The icons the table references, once per hash: the wire carries the
+      // 32x32 BGRA bytes inside the protocol's cap, and the client serves them by
+      // the same hash the entry carries.
+      for (const auto &rec : windows) {
+        if (rec.icon_hash == 0) {
+          continue;
+        }
+        auto &sentIcons = session->seamless_table.icons_sent;
+        if (std::find(sentIcons.begin(), sentIcons.end(), rec.icon_hash) != sentIcons.end()) {
+          continue;
+        }
+        std::vector<std::uint8_t> pixels;
+        if (!platf::seamless::icon_bytes(rec.icon_hash, pixels) ||
+            pixels.size() > SEAMLESS_MAX_ICON) {
+          continue;
+        }
+        std::vector<std::uint8_t> icon(SEAMLESS_ICON_HEADER_SIZE + pixels.size());
+        icon[0] = SEAMLESS_MSG_ICON;
+        for (int b = 0; b < 4; b++) {
+          icon[1 + b] = (std::uint8_t) ((rec.icon_hash >> (8 * b)) & 0xFFu);
+        }
+        icon[5] = (std::uint8_t) (pixels.size() & 0xFFu);
+        icon[6] = (std::uint8_t) ((pixels.size() >> 8) & 0xFFu);
+        std::copy(pixels.begin(), pixels.end(), icon.begin() + SEAMLESS_ICON_HEADER_SIZE);
+
+        std::array<std::uint8_t, sizeof(control_header_v2) + SEAMLESS_ICON_HEADER_SIZE + SEAMLESS_MAX_ICON> iconPlain {};
+        auto *iconHeader = reinterpret_cast<control_header_v2 *>(iconPlain.data());
+        iconHeader->type = SEAMLESS_PACKET_TYPE;
+        iconHeader->payloadLength = static_cast<std::uint16_t>(icon.size());
+        std::copy(icon.begin(), icon.end(), iconPlain.begin() + sizeof(control_header_v2));
+
+        std::array<std::uint8_t,
+          sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + SEAMLESS_ICON_HEADER_SIZE + SEAMLESS_MAX_ICON) + crypto::cipher::tag_size>
+          iconCipher;
+        const std::string_view iconBody {reinterpret_cast<const char *>(iconPlain.data()),
+                                         sizeof(control_header_v2) + icon.size()};
+        const auto iconPayload = encode_control(session, iconBody, iconCipher);
+        if (!iconPayload.empty() && session->control.peer &&
+            session->broadcast_ref->control_server.send(iconPayload, session->control.peer) == 0) {
+          sentIcons.push_back(rec.icon_hash);
+          BOOST_LOG(info) << "Seamless: icon hash=0x"sv << util::hex(rec.icon_hash).to_string_view()
+                          << " bytes="sv << pixels.size();
+        }
       }
 
       BOOST_LOG(verbose) << "Seamless: "sv << (kind == 1 ? "snapshot"sv : "delta"sv)
