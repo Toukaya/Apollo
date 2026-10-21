@@ -933,7 +933,13 @@ namespace stream {
       // asks the same question with the same pid.
       // The scope is the launched app's process tree: the app and its own
       // processes. A second launch appends its tree through the same call.
-      const auto scope = platf::seamless::process_tree(proc::proc.pid());
+      // The scope is the UNION of every launched app's process tree: a second
+      // pick appends to the launched set, so its windows join the table.
+      std::vector<std::uint32_t> scope;
+      for (const auto root : proc::proc.launched_pids()) {
+        const auto tree = platf::seamless::process_tree(root);
+        scope.insert(scope.end(), tree.begin(), tree.end());
+      }
       if (!platf::seamless::snapshot(windows, scope)) {
         BOOST_LOG(warning) << "Seamless: window enumeration failed"sv;
         return;

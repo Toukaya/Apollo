@@ -187,8 +187,13 @@ namespace proc {
       terminate(false, false);
       std::this_thread::sleep_for(1s);
     } else {
-      // Ensure starting from a clean slate
-      terminate(false, false);
+      // A second launch APPENDS: the running app keeps running and its process is
+      // kept alive here, so both apps coexist and the window table covers both.
+      if (_process.valid()) {
+        _kept_processes.emplace_back(std::move(_process), std::move(_process_group));
+        _process = boost::process::v1::child();
+        _process_group = boost::process::v1::group();
+      }
     }
 
     _app = app;
@@ -729,6 +734,15 @@ namespace proc {
 
     _process = boost::process::v1::child();
     _process_group = boost::process::v1::group();
+
+    // Every kept app goes with the session: closing the host's session tears the
+    // whole launched set down, not only the last app.
+    for (auto &kept : _kept_processes) {
+      if (!immediate) {
+        terminate_process_group(kept.first, kept.second, _app.exit_timeout);
+      }
+    }
+    _kept_processes.clear();
 
     _env["APOLLO_APP_STATUS"] = "TERMINATING";
 

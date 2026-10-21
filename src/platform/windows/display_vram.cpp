@@ -1657,7 +1657,12 @@ namespace platf::dxgi {
           now - seamless_last_enum >= std::chrono::milliseconds(platf::seamless::POLL_INTERVAL_MS)) {
         std::vector<platf::seamless::window_rec> refreshed;
         // One scope, shared with the publisher: the launched app's process.
-        const auto scope = platf::seamless::process_tree(proc::proc.pid());
+        // The union over every launched root, the same scope the publisher uses.
+        std::vector<std::uint32_t> scope;
+        for (const auto root : proc::proc.launched_pids()) {
+          const auto tree = platf::seamless::process_tree(root);
+          scope.insert(scope.end(), tree.begin(), tree.end());
+        }
         if (!platf::seamless::snapshot(refreshed, scope)) {
           return capture_e::error;
         }
