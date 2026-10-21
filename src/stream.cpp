@@ -736,6 +736,29 @@ namespace stream {
                              << " kind="sv << (int) bytes[2]
                              << " rect="sv << rdi16(bytes + 3) << ',' << rdi16(bytes + 5) << ' '
                              << rd16(bytes + 7) << 'x' << rd16(bytes + 9);
+
+          // Kind 5 is a close: the operator's ruling added it as a VALUE of this
+          // message's existing kind field (no layout change, kinds 0-4 untouched).
+          // The id resolves against the scoped table with the same low-byte rule
+          // and the same ambiguity refusal as the focus message.
+          if (bytes[2] == 5) {
+            HWND target = nullptr;
+            int matches = 0;
+            for (const auto &rec : session->seamless_table.inflight) {
+              if ((rec.id & 0xFFu) == bytes[1]) {
+                target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(rec.id));
+                matches++;
+              }
+            }
+            if (target != nullptr && matches == 1) {
+              SendNotifyMessageW(target, WM_CLOSE, 0, 0);
+              BOOST_LOG(info) << "Seamless: close intent applied to window="sv << (int) bytes[1];
+            }
+            else {
+              BOOST_LOG(warning) << "Seamless: close intent for window="sv << (int) bytes[1]
+                                 << " matched "sv << matches << " windows, dropped"sv;
+            }
+          }
           break;
         }
 
