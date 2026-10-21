@@ -856,7 +856,10 @@ namespace stream {
           BOOST_LOG(warning) << "Seamless: the empty fallback table could not be sent, it will be retried"sv;
           return;
         }
-        BOOST_LOG(info) << "Seamless: the capture side cannot carry the canvas, one empty table sent and publishing stops"sv;
+        // D5: the same line carries the canvas and the entry count, so the reading
+        // procedure can assert both without joining two sources.
+        BOOST_LOG(info) << "Seamless: the capture side cannot carry the canvas, one empty table sent and publishing stops"
+                        << " canvas="sv << canvas.w << 'x' << canvas.h << " entries=0"sv;
         return;
       }
       if (now_ms - session->seamless_last_poll_ms < platf::seamless::POLL_INTERVAL_MS) {

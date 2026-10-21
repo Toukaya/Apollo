@@ -123,6 +123,30 @@ namespace platf::seamless {
         continue;
       }
 
+      // Rule (c) of the layout ruling: row widths never increase downwards, so
+      // there is never a step of encoded-but-empty transport above a wider row.
+      {
+        std::vector<std::uint32_t> widths;
+        std::uint32_t cursor_y = UINT32_MAX;
+        for (const auto &cell : cells) {
+          if (cursor_y != cell.y) {
+            widths.push_back(0);
+            cursor_y = cell.y;
+          }
+          widths.back() += cell.w;
+        }
+        bool non_increasing = true;
+        for (size_t r = 1; r < widths.size(); r++) {
+          if (widths[r] > widths[r - 1]) {
+            non_increasing = false;
+            break;
+          }
+        }
+        if (!non_increasing) {
+          continue;
+        }
+      }
+
       const std::uint32_t needed_h = (std::uint32_t) (CANVAS_ALIGNMENT *
                                                       ((shelf_y + shelf_h + CANVAS_ALIGNMENT - 1) / CANVAS_ALIGNMENT));
       const std::uint64_t area = (std::uint64_t) candidate_w * needed_h;
