@@ -728,7 +728,7 @@ namespace stream {
             BOOST_LOG(warning) << "Seamless: intent message of "sv << length << " bytes dropped"sv;
             return;
           }
-          if (bytes[2] > SEAMLESS_INTENT_STICKY) {
+          if (bytes[2] > SEAMLESS_INTENT_CLOSE) {
             BOOST_LOG(warning) << "Seamless: intent kind "sv << (int) bytes[2] << " dropped"sv;
             return;
           }
@@ -741,7 +741,7 @@ namespace stream {
           // message's existing kind field (no layout change, kinds 0-4 untouched).
           // The id resolves against the scoped table with the same low-byte rule
           // and the same ambiguity refusal as the focus message.
-          if (bytes[2] == 5) {
+          if (bytes[2] == SEAMLESS_INTENT_CLOSE) {
             HWND target = nullptr;
             int matches = 0;
             if (bytes[1] < session->seamless_table.published.size()) {
