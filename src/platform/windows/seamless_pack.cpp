@@ -49,7 +49,6 @@ namespace platf::seamless {
     std::sort(order.begin(), order.end(), place_before);
 
     // Drop what can never be placed, and measure what has to fit.
-    std::uint64_t total_area = 0;
     std::uint32_t widest = 0;
     std::vector<window_rec> placeable;
     for (const auto &window : order) {
@@ -62,7 +61,6 @@ namespace platf::seamless {
       if (window.w > CANVAS_MAX || window.h > CANVAS_MAX) {
         continue;
       }
-      total_area += (std::uint64_t) window.w * window.h;
       widest = std::max<std::uint32_t>(widest, window.w);
       placeable.push_back(window);
     }
